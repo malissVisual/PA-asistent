@@ -11,6 +11,7 @@ indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_l
 //  Zóny = moje obdélníky (text) + auto levely + single prints (každé 30min okno = profil
 //  z 1m svíček; single print = cena, přes kterou v okně prošla jen jedna 1m svíčka; platí
 //  přes dny až do vyplnění). Boxy zón se kreslí jen blízko ceny (jinak by roztáhly osu).
+//  Zóna, do které aktuální svíčka zasahuje, změní barvu (jen kresba, signály se tím nemění).
 //  Vzhled: tečky = rejection wicky, ↑↓ = displacement, ▲▼ = entry, × = FAIL,
 //  ◆ = respect zóny, ◇ = první dotek po RUN, ◈ = SMT divergence. Na grafu žádný text – detaily v tooltipu (najeď myší).
 //  Stav = tečka vpravo. Vše jen na UZAVŘENÉ svíčce → žádný repaint. "b." = body.
@@ -62,6 +63,7 @@ GP = "Mini panel"
 GB = "Backtest"
 G9 = "Alerty"
 GM = "SMT"
+GT = "Zóna s cenou uvnitř"
 MAX_SMT = 60
 SMT_HISTORY = 3000
 
@@ -237,6 +239,10 @@ T_SP_BG     = 90    // výplň single printu
 T_SP_LINE   = 20    // 1řádkový single print (čára)
 T_SPDONE    = 80    // vyplněný single print (okraj / čára)
 T_SPDONE_BG = 95    // vyplněný single print (výplň)
+// (barva cTap je vstup na konci vstupů – skupina „Zóna s cenou uvnitř“, aby se neposunulo uložené nastavení)
+T_TAP_BRD   = 20    // okraj zóny s cenou uvnitř
+T_TAP_BG    = 75    // výplň zóny s cenou uvnitř
+T_TAP_LINE  = 10    // 1řádkový single print s cenou na něm (čára)
 // ── Průhlednosti: stav a mini panel
 T_STAT      = 0    // stavová tečka v session (range / long / short)
 T_STAT_OFF  = 50    // stavová tečka mimo session
@@ -280,6 +286,11 @@ alRetapArm = input.bool(false, "Alert: retap připraven", tooltip="Alert, když 
 alEntry    = input.bool(true, "Alert: entry", tooltip="Alert při navrženém entry (ve směru biasu) včetně kontextu.", group=G9, display=display.none)
 alFail     = input.bool(false, "Alert: FAIL", tooltip="Alert při failed displacementu / ztrátě zóny.", group=G9, display=display.none)
 
+// GT – Zóna s cenou uvnitř. Nové vstupy patří vždy NA KONEC: TradingView ukládá nastavení podle pořadí vstupů,
+// vstup vložený doprostřed by posunul uložené hodnoty všech následujících (zóny, barvy, alerty …).
+zoneTapHi = input.bool(true, "Přebarvit zónu, když je v ní cena", tooltip="Zóna, auto level i single print změní barvu, dokud aktuální svíčka zasahuje do zóny (high ≥ spodní hrana a low ≤ horní hrana). Na živé svíčce se mění průběžně. Jen kresba – vyhodnocení zón, entry a alerty se tím nemění.", group=GT, display=display.none)
+cTap      = input.color(#C9AE3C, "Barva zóny s cenou uvnitř", tooltip="Barva zóny / auto levelu / single printu, do kterého aktuální svíčka právě zasahuje. Průhlednost = T_TAP_* v sekci VZHLED.", group=GT, display=display.none)
+
 // ───────── Odvozená nastavení ─────────
 tsz          = txtSize == "Drobný" ? SZ_PANEL_S : txtSize == "Normální" ? SZ_PANEL_L : SZ_PANEL_M
 tPos         = tablePos == "Vpravo dole" ? position.bottom_right : tablePos == "Vlevo nahoře" ? position.top_left : tablePos == "Vlevo dole" ? position.bottom_left : position.top_right
@@ -311,6 +322,7 @@ type Zone
     line   ln               // SP: 1řádkový print = čára
     int lastTapL = na       // poslední vykreslené ◇ long na této zóně
     int lastTapS = na       // poslední vykreslené ◇ short na této zóně
+    bool tap = false        // aktuální svíčka zasahuje do zóny (jen kresba na poslední svíčce)
 
 // Čekající retap (dir +1 long, -1 short); inval = close za touto cenou ho zruší
 type ZoneTap
@@ -434,14 +446,15 @@ pushLabel(array<label> arr, label lb, int cap) =>
             label.delete(arr.shift())
     arr.size()
 
-// Styl boxu zóny podle stavu (single prints mají vlastní styl)
+// Styl boxu zóny podle stavu (single prints mají vlastní styl); cena uvnitř zóny (z.tap) má přednost
 styleZone(Zone z) =>
     if not na(z.bx) and not z.isSP
         color base = z.isAuto ? cNeut : cZone
         bool  run  = z.state == 2 or z.state == -2
-        color bc   = z.state == 1 ? color.new(cBull, T_ZONE_RESP) : z.state == -1 ? color.new(cBear, T_ZONE_RESP) : run ? color.new(cNeut, T_ZONE_RUN) : color.new(base, z.isAuto ? T_AUTO_BRD : T_ZONE_BRD)
+        color bc   = z.tap ? color.new(cTap, T_TAP_BRD) : z.state == 1 ? color.new(cBull, T_ZONE_RESP) : z.state == -1 ? color.new(cBear, T_ZONE_RESP) : run ? color.new(cNeut, T_ZONE_RUN) : color.new(base, z.isAuto ? T_AUTO_BRD : T_ZONE_BRD)
         z.bx.set_border_color(bc)
         z.bx.set_border_style(run ? ST_ZONE_RUN : ST_ZONE)
+        z.bx.set_bgcolor(z.tap ? color.new(cTap, T_TAP_BG) : color.new(base, z.isAuto ? T_AUTO_BG : T_ZONE_BG))
     z.state
 
 // Nový box zóny x1..x2, bez textu
@@ -712,27 +725,32 @@ zDraw(Zone z, int x1, int x2) =>
     styleZone(z)
     true
 
-// Nevyplněný single print x1..x2: 1 řádek = čára, víc řádků = box (po vyplnění části se typ může změnit)
+// Nevyplněný single print x1..x2: 1 řádek = čára, víc řádků = box (po vyplnění části se typ může změnit);
+// cena uvnitř (z.tap) = barva cTap
 spDraw(Zone z, int x1, int x2) =>
-    bool one = z.top - z.bot < z.st * 0.5
+    bool  one = z.top - z.bot < z.st * 0.5
+    color sc  = z.tap ? cTap : cSP
     if one
         if not na(z.bx)
             z.bx.delete()
             z.bx := na
         if na(z.ln)
-            z.ln := line.new(x1, z.top, x2, z.top, xloc=xloc.bar_index, color=color.new(cSP, T_SP_LINE), style=ST_SP, width=W_LINE)
+            z.ln := line.new(x1, z.top, x2, z.top, xloc=xloc.bar_index, color=color.new(sc, z.tap ? T_TAP_LINE : T_SP_LINE), style=ST_SP, width=W_LINE)
         else
             z.ln.set_xy1(x1, z.top)
             z.ln.set_xy2(x2, z.top)
+            z.ln.set_color(color.new(sc, z.tap ? T_TAP_LINE : T_SP_LINE))
     else
         if not na(z.ln)
             z.ln.delete()
             z.ln := na
         if na(z.bx)
-            z.bx := box.new(x1, z.top, x2, z.bot, border_color=color.new(cSP, T_SP_BRD), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(cSP, T_SP_BG))
+            z.bx := box.new(x1, z.top, x2, z.bot, border_color=color.new(sc, z.tap ? T_TAP_BRD : T_SP_BRD), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(sc, z.tap ? T_TAP_BG : T_SP_BG))
         else
             z.bx.set_lefttop(x1, z.top)
             z.bx.set_rightbottom(x2, z.bot)
+            z.bx.set_border_color(color.new(sc, z.tap ? T_TAP_BRD : T_SP_BRD))
+            z.bx.set_bgcolor(color.new(sc, z.tap ? T_TAP_BG : T_SP_BG))
     one
 
 // Vyplněná část: zesvětlená kresba končící na svíčce vyplnění (max. MAX_SPDONE);
@@ -2136,6 +2154,8 @@ if barstate.islast
             Zone  z    = zAt(k, nZd0)
             float dz   = close > z.top ? close - z.top : close < z.bot ? z.bot - close : 0.0
             bool  want = (z.isSP ? spShow : showZones) and (zoneShowPts <= 0 or dz <= zoneShowPts) and (not z.isAuto or stLive)
+            // cena právě v zóně: aktuální (i tvořící se) svíčka zasahuje do zóny → jiná barva
+            z.tap := zoneTapHi and high >= z.bot and low <= z.top
             if want
                 int x1 = z.isSP or z.isAuto ? math.min(math.max(nz(z.x0, xL), xL), bar_index) : xL
                 if z.isSP
