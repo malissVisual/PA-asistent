@@ -1,5 +1,5 @@
 //@version=6
-indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_polylines_count=100)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  1m Price Action Asistent · V4b
@@ -14,6 +14,8 @@ indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_l
 //  Zóna, do které aktuální svíčka zasahuje, změní barvu (jen kresba, signály se tím nemění).
 //  Clustery = POC + okolní řádky téhož 30min TPO profilu (cena tu „seděla“); překryv s dřívějším = sloučení
 //  a sytější výplň. Jen kresba – do vyhodnocení zón, entry ani alertů nevstupují.
+//  TPO profily = histogramy posledních oken (+ tvořící se okno) vedle sebe vpravo od ceny nebo na svém místě:
+//  value area modře, okraje fialově, POC čára. Jen kresba.
 //  Vzhled: tečky = rejection wicky, ↑↓ = displacement, ▲▼ = entry, × = FAIL,
 //  ◆ = respect zóny, ◇ = první dotek po RUN, ◈ = SMT divergence. Na grafu žádný text – detaily v tooltipu (najeď myší).
 //  Stav = tečka vpravo. Vše jen na UZAVŘENÉ svíčce → žádný repaint. "b." = body.
@@ -29,8 +31,11 @@ MAX_HIST   = 40      // max. minulých range boxů
 MAX_EVT    = 250     // max. značek událostí (šipky, kosočtverce, křížky)
 MAX_DEAD   = 80      // max. ukončených čar retapů
 MAX_OPEN   = 10      // max. čar Open (posledních sessions)
-MAX_SPDONE = 30      // max. vyplněných (zesvětlených) single prints v historii
+MAX_SPDONE = 80      // max. vyplněných (zesvětlených) single prints v historii
+SP_BACK    = 4999    // single prints se kreslí od svého vzniku, nejdřív tolik svíček zpět
 SP_MAXROWS = 2000    // max. řádků jednoho okna (větší rozsah = okno se přeskočí)
+TP_KEEP    = 20      // max. uložených hotových TPO profilů (kresba)
+TP_ROOM    = 495     // TPO profily vpravo: max. svíček za poslední svíčkou (TradingView kreslí max. 500 do budoucna)
 // Backtest (skupiny statistik: 0–5 typy entry, pak souhrny)
 BT_NK      = 6       // typy entry: 0 RETAP·DISP, 1 RETAP·ZÓNA, 2 WICK·SWING, 3 WICK·ZÓNA, 4 DISP, 5 RUN
 BT_TOT     = 6       // CELKEM
@@ -67,6 +72,7 @@ G9 = "Alerty"
 GM = "SMT"
 GT = "Zóna s cenou uvnitř"
 GC = "Clustery (TPO)"
+GTP = "TPO profily"
 MAX_SMT = 60
 SMT_HISTORY = 3000
 
@@ -129,8 +135,8 @@ spStepNQ         = input.float(1.0, "Krok NQ/MNQ (body)", minval=0.25, step=0.25
 spStepOtherTicks = input.int(1, "Krok ostatní (ticky)", minval=1, tooltip="Výška řádku profilu pro ostatní symboly v ticích (ES / MES: 1 tick = 0.25).", group=GS, display=display.none)
 spTails          = input.bool(false, "Včetně tailů (single prints na okraji profilu)", tooltip="Vypnuto (výchozí): jen vnitřní single prints – nad i pod nimi musí být řádek s aspoň 2 TPO. Zapnuto: i buying / selling tail na okraji profilu.", group=GS, display=display.none)
 spMinRows        = input.int(1, "Min. délka single print (řádky)", minval=1, tooltip="Single print kratší než tento počet řádků se při vzniku ignoruje (zbytky po částečném vyplnění zůstávají).", group=GS, display=display.none)
-spMax            = input.int(40, "Max. nevyplněných single prints", minval=5, maxval=100, tooltip="Kolik nevyplněných single prints držet; při překročení se zahodí nejvzdálenější od ceny.", group=GS, display=display.none)
-spShow           = input.bool(true, "Kreslit single prints", tooltip="Nevyplněný single print = tenký box (1 řádek = čára) od TPO periody vzniku po poslední svíčku – jen blízko ceny (viz Zóny). Řádek je vyplněný, jakmile se na jeho ceně obchoduje; vyplněná část končí na svíčce vyplnění a zesvětlí se (posledních 30).", group=GS, display=display.none)
+spMax            = input.int(80, "Max. nevyplněných single prints", minval=5, maxval=100, tooltip="Kolik nevyplněných single prints držet; při překročení se zahodí nejvzdálenější od ceny.", group=GS, display=display.none)
+spShow           = input.bool(true, "Kreslit single prints", tooltip="Nevyplněný single print = tenký box (1 řádek = čára) od TPO periody vzniku po poslední svíčku – jen blízko ceny (viz Zóny). Řádek je vyplněný, jakmile se na jeho ceně obchoduje; vyplněná část končí na svíčce vyplnění a zesvětlí se (posledních 80). Barva podle směru – viz Single prints: barva podle směru (na konci nastavení).", group=GS, display=display.none)
 
 // G7 – Volatilita
 atrLen     = input.int(14, "ATR délka", minval=1, tooltip="Hlavní ATR pro filtr wicků, silnou svíčku, swingy a volatilitu.", group=G7, display=display.none)
@@ -238,11 +244,11 @@ T_AUTO_BG   = 95    // výplň auto levelu
 T_AUTO_TXT  = 40    // název auto levelu
 T_ZONE_RESP = 55    // okraj zóny po respectu (barva směru)
 T_ZONE_RUN  = 70    // okraj zóny po run-through (neutrální)
-T_SP_BRD    = 20    // okraj single printu
-T_SP_BG     = 90    // výplň single printu
-T_SP_LINE   = 20    // 1řádkový single print (čára)
-T_SPDONE    = 80    // vyplněný single print (okraj / čára)
-T_SPDONE_BG = 95    // vyplněný single print (výplň)
+T_SP_BRD    = 35    // okraj single printu
+T_SP_BG     = 60    // výplň single printu
+T_SP_LINE   = 25    // 1řádkový single print (čára)
+T_SPDONE    = 70    // vyplněný single print (okraj / čára)
+T_SPDONE_BG = 85    // vyplněný single print (výplň)
 // (barva cTap je vstup na konci vstupů – skupina „Zóna s cenou uvnitř“, aby se neposunulo uložené nastavení)
 T_TAP_BRD   = 20    // okraj zóny s cenou uvnitř
 T_TAP_BG    = 75    // výplň zóny s cenou uvnitř
@@ -252,6 +258,12 @@ T_CL_BRD    = 50    // okraj clusteru
 T_CL_BG     = 88    // výplň clusteru z jednoho okna
 T_CL_STEP   = 6     // každé další sloučené okno = výplň o tolik sytější
 T_CL_BG_MIN = 70    // nejsytější výplň clusteru
+// (barvy TPO profilů jsou vstupy na konci vstupů – skupina „TPO profily“)
+T_TPO_VA    = 35    // výplň value area
+T_TPO_OUT   = 45    // výplň mimo value area
+T_TPO_POC   = 0     // čára POC
+T_TPO_LIVE  = 25    // tvořící se profil: o tolik průhlednější
+T_TPO_TXT   = 30    // čas pod profilem
 // ── Průhlednosti: stav a mini panel
 T_STAT      = 0    // stavová tečka v session (range / long / short)
 T_STAT_OFF  = 50    // stavová tečka mimo session
@@ -301,12 +313,30 @@ zoneTapHi = input.bool(true, "Přebarvit zónu, když je v ní cena", tooltip="Z
 cTap      = input.color(#C9AE3C, "Barva zóny s cenou uvnitř", tooltip="Barva zóny / auto levelu / single printu, do kterého aktuální svíčka právě zasahuje. Průhlednost = T_TAP_* v sekci VZHLED.", group=GT, display=display.none)
 
 // GC – Clustery z TPO profilu (stejná 30min okna a krok řádků jako single prints)
-useCL    = input.bool(true, "Clustery (TPO)", tooltip="Opak single printu: v každém okně profilu (Single prints → Okno profilu, výchozí 30 min) řádek, přes který prošlo nejvíc 1m svíček (POC), + sousední řádky s aspoň „× POC“ svíček = cluster (cena tu seděla, trh ji přijal). Cluster, který se překryje s dřívějším, se s ním sloučí a jeho výplň zesílí (cena tu seděla ve víc oknech). Jen kresba – entry, alerty ani vyhodnocení zón nemění.", group=GC, display=display.none)
+useCL    = input.bool(false, "Clustery (TPO)", tooltip="Opak single printu: v každém okně profilu (Single prints → Okno profilu, výchozí 30 min) řádek, přes který prošlo nejvíc 1m svíček (POC), + sousední řádky s aspoň „× POC“ svíček = cluster (cena tu seděla, trh ji přijal). Cluster, který se překryje s dřívějším, se s ním sloučí a jeho výplň zesílí (cena tu seděla ve víc oknech). Jen kresba – entry, alerty ani vyhodnocení zón nemění.", group=GC, display=display.none)
 clPct    = input.float(0.7, "Cluster = řádky s ≥ × svíček POC", minval=0.3, maxval=1.0, step=0.05, tooltip="Souvislý blok řádků kolem POC, které mají aspoň tento podíl počtu svíček POC. 1.0 = jen POC (nejužší), menší číslo = širší cluster.", group=GC, display=display.none)
 clMinTpo = input.int(6, "Min. svíček v POC", minval=2, maxval=60, tooltip="Okno, ve kterém POC nemá aspoň tolik 1m svíček (cena nikde dlouho neseděla), cluster nevytvoří.", group=GC, display=display.none)
 clMaxW   = input.float(6.0, "Max. šířka clusteru (body)", minval=0.0, step=0.25, tooltip="Širší blok se ořízne kolem POC; sloučení s dřívějším clusterem jen do této šířky (jinak jen zesílí výplň).", group=GC, display=display.none)
 clMax    = input.int(15, "Max. clusterů", minval=1, maxval=60, tooltip="Kolik clusterů držet; při překročení se zahodí nejvzdálenější od ceny. Kreslí se podle volby Zóny → Kreslit zóny do vzdálenosti.", group=GC, display=display.none)
 cCL      = input.color(#7D6BA8, "Barva clusterů", tooltip="Okraj a výplň clusteru (průhlednost = T_CL_* v sekci VZHLED; silnější cluster = sytější výplň).", group=GC, display=display.none)
+
+// GTP – TPO profily (stejná okna a krok řádků jako single prints / clustery)
+tpOn    = input.bool(true, "TPO profily", tooltip="Histogram každého okna profilu (Single prints → Okno profilu, výchozí 30 min): délka řádku = počet 1m svíček, které přes cenu prošly. Value area (podíl níže) modře, okraje fialově, POC = čára. Jen kresba – entry ani alerty nemění.", group=GTP, display=display.none)
+tpPlace = input.string("Vpravo vedle ceny", "Umístění", options=["Vpravo vedle ceny", "Na svém místě"], tooltip="Vpravo vedle ceny: poslední profily vedle sebe za poslední svíčkou (nejstarší vlevo, tvořící se vpravo). Na svém místě: každý profil začíná na první svíčce svého okna (překrývá svíčky).", group=GTP, display=display.none)
+tpN     = input.int(6, "Počet hotových profilů", minval=1, maxval=TP_KEEP, tooltip="Kolik posledních hotových oken kreslit. Vpravo se kreslí jen tolik, kolik se vejde do 495 svíček za poslední svíčkou (TradingView limit).", group=GTP, display=display.none)
+tpLive  = input.bool(true, "I tvořící se profil", tooltip="Kreslit i profil právě běžícího okna (mění se s každou svíčkou).", group=GTP, display=display.none)
+tpVA    = input.float(70.0, "Value area (%)", minval=10.0, maxval=100.0, step=5.0, tooltip="Value area = řádky kolem POC, které obsahují tento podíl všech TPO okna (od POC se přidává sousední řádek s víc svíčkami).", group=GTP, display=display.none)
+tpW     = input.int(2, "Šířka 1 TPO (svíčky)", minval=1, maxval=5, tooltip="Kolik svíček na šířku zabere jedna 1m svíčka v profilu.", group=GTP, display=display.none)
+tpOff   = input.int(15, "Odsazení od ceny (svíčky)", minval=0, maxval=200, tooltip="Vpravo vedle ceny: mezera mezi poslední svíčkou a prvním profilem.", group=GTP, display=display.none)
+tpGap   = input.int(3, "Mezera mezi profily (svíčky)", minval=0, maxval=50, group=GTP, display=display.none)
+cTpoVA  = input.color(#4A4FC9, "Value area", group=GTP, display=display.none)
+cTpoOut = input.color(#B44FB8, "Mimo value area", group=GTP, display=display.none)
+cTpoPoc = input.color(#E8A33D, "POC", group=GTP, display=display.none)
+tpStyle  = input.string("Hladký", "Tvar profilu", options=["Hladký", "Schody"], tooltip="Hladký: obrys profilu spojuje středy řádků (čistší vzhled). Schody: každý řádek jako schod (přesný histogram).", group=GTP, display=display.none)
+tpLabels = input.bool(true, "Čas pod profilem (detail v tooltipu)", tooltip="Pod každým profilem čas začátku okna (NY), u tvořícího se „teď“. Najetím myší: POC, value area a rozsah okna.", group=GTP, display=display.none)
+
+// Single prints – barva podle směru (vstup na konci, aby se neposunulo uložené nastavení)
+spDirCol = input.bool(true, "Single prints: barva podle směru", tooltip="Zapnuto: single print, kterým cena proletěla nahoru (býčí svíčka), má barvu Bull / long, dolů barvu Bear / short. Vypnuto: všechny barvou Single prints.", group=GS, display=display.none)
 
 // ───────── Odvozená nastavení ─────────
 tsz          = txtSize == "Drobný" ? SZ_PANEL_S : txtSize == "Normální" ? SZ_PANEL_L : SZ_PANEL_M
@@ -341,6 +371,7 @@ type Zone
     int lastTapS = na       // poslední vykreslené ◇ short na této zóně
     bool tap = false        // aktuální svíčka zasahuje do zóny (jen kresba na poslední svíčce)
     int hits = 1            // cluster: počet sloučených oken profilu (síla)
+    int dir = 0             // SP: směr svíčky, která printem proletěla (+1 nahoru, -1 dolů, 0 neznámý)
 
 // Čekající retap (dir +1 long, -1 short); inval = close za touto cenou ho zruší
 type ZoneTap
@@ -393,6 +424,18 @@ type EntryDraw
 type SpDone
     box  b
     line l
+
+// TPO profil jednoho okna: řádek i = cena (r0 + i) × st, cnt = počet 1m svíček v řádku
+type TpoProf
+    int        r0
+    float      st
+    array<int> cnt
+    int        x0      // první svíčka okna
+    int        poc     // index POC
+    int        vaLo    // value area: nejnižší / nejvyšší index
+    int        vaHi
+    int        mx      // počet svíček POC (= šířka profilu v TPO)
+    int        t0      // čas začátku okna (ms)
 
 // Backtest: otevřený obchod (jen při btOn)
 type BtTrade
@@ -712,6 +755,115 @@ var int          spWKey    = na    // klíč běžícího okna (floor(time / okn
 var int          spWBar    = na    // první bar běžícího okna
 var array<float> spWH      = array.new<float>()
 var array<float> spWL      = array.new<float>()
+var array<int>   spWD      = array.new<int>()     // směr 1m svíček okna (+1 close ≥ open, -1 jinak) → barva SP
+
+// ───────── TPO profily (jen kresba) ─────────
+var array<TpoProf>  tpProfs = array.new<TpoProf>()    // hotová okna (max. TP_KEEP)
+var array<polyline> tpPolys = array.new<polyline>()   // kresby (smažou se a nakreslí znovu na poslední svíčce)
+var array<label>    tpLbls  = array.new<label>()      // čas pod profily (dtto)
+
+// POC (při shodě blíž středu okna) a value area: od POC přidávat sousední řádek s víc svíčkami, dokud ≥ tpVA %
+tpoMake(int r0, float st, array<int> cnt, int x0, int t0) =>
+    int   n   = cnt.size()
+    int   mx  = 0
+    int   poc = 0
+    int   tot = 0
+    float mid = (n - 1) / 2.0
+    for i = 0 to n - 1
+        int c = cnt.get(i)
+        tot += c
+        if c > mx or (c == mx and math.abs(i - mid) < math.abs(poc - mid))
+            mx  := c
+            poc := i
+    int   lo   = poc
+    int   hi   = poc
+    int   sum  = mx
+    float need = tot * tpVA / 100.0
+    while sum < need and (lo > 0 or hi < n - 1)
+        int cDn = -1
+        int cUp = -1
+        if lo > 0
+            cDn := cnt.get(lo - 1)
+        if hi < n - 1
+            cUp := cnt.get(hi + 1)
+        if cUp >= cDn
+            hi  += 1
+            sum += cUp
+        else
+            lo  -= 1
+            sum += cDn
+    TpoProf.new(r0, st, cnt, x0, poc, lo, hi, mx, t0)
+
+// Profil z high / low 1m svíček okna (stejné řádky jako single prints); na = prázdné / příliš velké okno
+tpoBuild(array<float> hs, array<float> ls, float st, int x0, int t0) =>
+    TpoProf p = na
+    if hs.size() > 0
+        int R0 = math.ceil(ls.min() / st - 1e-6)
+        int nR = math.floor(hs.max() / st + 1e-6) - R0 + 1
+        if nR >= 1 and nR <= SP_MAXROWS
+            array<int> cw = array.new<int>(nR + 1, 0)
+            for b = 0 to hs.size() - 1
+                int a1 = math.max(math.ceil(ls.get(b) / st - 1e-6) - R0, 0)
+                int b1 = math.min(math.floor(hs.get(b) / st + 1e-6) - R0, nR - 1)
+                if a1 <= b1
+                    cw.set(a1, cw.get(a1) + 1)
+                    cw.set(b1 + 1, cw.get(b1 + 1) - 1)
+            int acc = 0
+            for j = 0 to nR - 1
+                acc += cw.get(j)
+                cw.set(j, acc)
+            cw.pop()
+            p := tpoMake(R0, st, cw, x0, t0)
+    p
+
+// Řádky a..b profilu jako vyplněný polygon od x0 doprava, bez obrysu.
+// Hladký: body ve středu řádků (šikmé spojnice); na hranici s vedlejší částí profilu (value area / okraj) společný
+// bod = průměr obou řádků, na okraji profilu 0 → části na sebe navazují. Schody: obrys po řádcích.
+tpoPoly(array<polyline> arr, TpoProf p, int a, int b, int x0, color c, int tr) =>
+    if a <= b
+        int   n  = p.cnt.size()
+        float h  = p.st * 0.5
+        float yL = (p.r0 + a) * p.st - h
+        float yU = (p.r0 + b) * p.st + h
+        array<chart.point> pts = array.new<chart.point>()
+        pts.push(chart.point.from_index(x0, yL))
+        if tpStyle == "Hladký"
+            float eL = 0.0
+            float eU = 0.0
+            if a > 0
+                eL := (p.cnt.get(a - 1) + p.cnt.get(a)) / 2.0
+            if b < n - 1
+                eU := (p.cnt.get(b) + p.cnt.get(b + 1)) / 2.0
+            pts.push(chart.point.from_index(x0 + math.round(eL * tpW), yL))
+            for i = a to b
+                pts.push(chart.point.from_index(x0 + p.cnt.get(i) * tpW, (p.r0 + i) * p.st))
+            pts.push(chart.point.from_index(x0 + math.round(eU * tpW), yU))
+        else
+            for i = a to b
+                int   x = x0 + p.cnt.get(i) * tpW
+                float y = (p.r0 + i) * p.st
+                pts.push(chart.point.from_index(x, y - h))
+                pts.push(chart.point.from_index(x, y + h))
+        pts.push(chart.point.from_index(x0, yU))
+        arr.push(polyline.new(pts, curved=false, closed=true, xloc=xloc.bar_index, line_color=color.new(c, T_INVIS), fill_color=color.new(c, tr)))
+    a <= b
+
+// Celý profil od x0: spodní okraj, value area, horní okraj, čára POC (max. 4 polylines) + čas pod profilem
+// (tooltip = POC, value area, rozsah). live = tvořící se okno: světlejší, popisek „teď“
+tpoDraw(array<polyline> arr, array<label> lbs, TpoProf p, int x0, bool live) =>
+    int n  = p.cnt.size()
+    int tL = live ? T_TPO_LIVE : 0
+    tpoPoly(arr, p, 0, p.vaLo - 1, x0, cTpoOut, math.min(T_TPO_OUT + tL, 100))
+    tpoPoly(arr, p, p.vaLo, p.vaHi, x0, cTpoVA, math.min(T_TPO_VA + tL, 100))
+    tpoPoly(arr, p, p.vaHi + 1, n - 1, x0, cTpoOut, math.min(T_TPO_OUT + tL, 100))
+    float yP = (p.r0 + p.poc) * p.st
+    arr.push(polyline.new(array.from(chart.point.from_index(x0, yP), chart.point.from_index(x0 + p.mx * tpW, yP)), curved=false, closed=false, xloc=xloc.bar_index, line_color=color.new(cTpoPoc, math.min(T_TPO_POC + tL, 100)), line_width=W_LINE))
+    if tpLabels
+        string t1  = str.format_time(p.t0, "HH:mm", TZ)
+        string t2  = str.format_time(p.t0 + spWin * 60000, "HH:mm", TZ)
+        string tip = "TPO " + t1 + "–" + t2 + " NY" + (live ? " (tvoří se)" : "") + "\nPOC " + fp(yP) + " · " + str.tostring(p.mx) + " sv.\nValue area " + fp((p.r0 + p.vaLo) * p.st) + "–" + fp((p.r0 + p.vaHi) * p.st) + " (" + fd(tpVA) + " %)\nRozsah " + fp(p.r0 * p.st) + "–" + fp((p.r0 + n - 1) * p.st) + " (" + fd((n - 1) * p.st) + " b.)"
+        lbs.push(label.new(x0 + math.round(p.mx * tpW / 2.0), (p.r0 - 1) * p.st, live ? "teď" : t1, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, color=color.new(cNeut, T_INVIS), textcolor=color.new(cNeut, T_TPO_TXT), size=SZ_MARK, tooltip=tip))
+    n
 
 // k-tá zóna ze spojeného seznamu: nejdřív ruční + auto (nM kusů), pak single prints
 zAt(int k, int nM) =>
@@ -744,11 +896,14 @@ zDraw(Zone z, int x1, int x2) =>
     styleZone(z)
     true
 
+// Barva single printu: podle směru svíčky, která jím proletěla (↑ cBull, ↓ cBear), jinak cSP
+spColor(int dir) => spDirCol and dir != 0 ? (dir == 1 ? cBull : cBear) : cSP
+
 // Nevyplněný single print x1..x2: 1 řádek = čára, víc řádků = box (po vyplnění části se typ může změnit);
 // cena uvnitř (z.tap) = barva cTap
 spDraw(Zone z, int x1, int x2) =>
     bool  one = z.top - z.bot < z.st * 0.5
-    color sc  = z.tap ? cTap : cSP
+    color sc  = z.tap ? cTap : spColor(z.dir)
     if one
         if not na(z.bx)
             z.bx.delete()
@@ -786,16 +941,17 @@ clDraw(Zone z, int x1, int x2) =>
         z.bx.set_bgcolor(bg)
     z.hits
 
-// Vyplněná část: zesvětlená kresba končící na svíčce vyplnění (max. MAX_SPDONE);
-// začátek nejdřív zoneBack svíček před vyplněním (dlouhé kresby by roztahovaly cenovou osu)
-spFinish(float top, float bot, int x0, float st) =>
+// Vyplněná část: zesvětlená kresba od vzniku printu do svíčky vyplnění (max. MAX_SPDONE; začátek max. SP_BACK
+// svíček zpět – limit kreseb v historii)
+spFinish(float top, float bot, int x0, float st, int dir) =>
     if spShow
-        int    x = math.max(nz(x0, bar_index), bar_index - zoneBack, 0)
+        int    x = math.max(nz(x0, bar_index), bar_index - SP_BACK, 0)
+        color  c = spColor(dir)
         SpDone d = SpDone.new(na, na)
         if top - bot < st * 0.5
-            d.l := line.new(x, top, bar_index, top, xloc=xloc.bar_index, color=color.new(cSP, T_SPDONE), style=ST_SP, width=W_LINE)
+            d.l := line.new(x, top, bar_index, top, xloc=xloc.bar_index, color=color.new(c, T_SPDONE), style=ST_SP, width=W_LINE)
         else
-            d.b := box.new(x, top, bar_index, bot, border_color=color.new(cSP, T_SPDONE), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(cSP, T_SPDONE_BG))
+            d.b := box.new(x, top, bar_index, bot, border_color=color.new(c, T_SPDONE), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(c, T_SPDONE_BG))
         spDone.push(d)
         if spDone.size() > MAX_SPDONE
             SpDone o = spDone.shift()
@@ -808,7 +964,7 @@ spFinish(float top, float bot, int x0, float st) =>
 // Odstranění single printu (hist = nechat zesvětlenou kresbu do historie)
 spRemove(Zone z, bool hist) =>
     if hist
-        spFinish(z.top, z.bot, z.x0, z.st)
+        spFinish(z.top, z.bot, z.x0, z.st, z.dir)
     zErase(z)
     hist
 
@@ -930,9 +1086,16 @@ if conf
 // (byly by hned vyplněné). Vyplňování po řádcích = Krok 4b (každá svíčka, platí přes dny).
 // Ze stejného profilu i CLUSTER: POC (řádek s nejvíc svíčkami) + souvislé sousední řádky s ≥ clPct × POC.
 int spWk = math.floor(time / (spWin * 60000.0))
-if conf and (useSP or useCL)
+if conf and (useSP or useCL or tpOn)
     if not na(spWKey) and spWk != spWKey and spWH.size() > 0
         float st  = spStep
+        // hotové okno → TPO profil (kresba)
+        if tpOn
+            TpoProf tp = tpoBuild(spWH, spWL, st, spWBar, spWKey * spWin * 60000)
+            if not na(tp)
+                tpProfs.push(tp)
+                if tpProfs.size() > TP_KEEP
+                    tpProfs.shift()
         float wLo = spWL.min()
         float wHi = spWH.max()
         int   R0  = math.ceil(wLo / st - 1e-6)
@@ -1015,15 +1178,24 @@ if conf and (useSP or useCL)
                         if i - rs >= spMinRows
                             float zBot = (R0 + rs) * st
                             float zTop = (R0 + i - 1) * st
-                            spz.push(Zone.new(zTop, zBot, "SP", false, na, 0, 0, -1000, 0, true, true, st, spWBar, bar_index, na))
+                            Zone  zs   = Zone.new(zTop, zBot, "SP", false, na, 0, 0, -1000, 0, true, true, st, spWBar, bar_index, na)
+                            // směr = svíčka, která prošla prostředním řádkem printu (single = právě jedna)
+                            float pm = (R0 + math.floor((rs + i - 1) / 2)) * st
+                            for b = 0 to spWH.size() - 1
+                                if spWL.get(b) <= pm + st * 0.001 and spWH.get(b) >= pm - st * 0.001
+                                    zs.dir := spWD.get(b)
+                                    break
+                            spz.push(zs)
                         rs := -1
         spWH.clear()
         spWL.clear()
+        spWD.clear()
     if na(spWKey) or spWk != spWKey
         spWKey := spWk
         spWBar := bar_index
     spWH.push(high)
     spWL.push(low)
+    spWD.push(close >= open ? 1 : -1)
 
 // ═════ KROK 1 – nová session: reset ═════
 if evOK and newSess
@@ -1657,11 +1829,12 @@ if conf and spz.size() > 0
                     spz.remove(i)
                 else
                     if hist
-                        spFinish(math.min(hr, zt) * z.st, math.max(lr, zb) * z.st, z.x0, z.st)
+                        spFinish(math.min(hr, zt) * z.st, math.max(lr, zb) * z.st, z.x0, z.st, z.dir)
                     if lr > zb and hr < zt
                         // svíčka uvnitř → horní zbytek = nový SP, spodní zůstává v z
                         // (close ≤ high < spodní hrana horního zbytku → close je pod ním)
                         Zone zHiPart = Zone.new(zt * z.st, (hr + 1) * z.st, "SP", false, na, -1, -1, z.lastEvt, 0, true, true, z.st, z.x0, z.born, na)
+                        zHiPart.dir := z.dir
                         spz.push(zHiPart)
                         z.top  := (lr - 1) * z.st
                     else if lr > zb
@@ -2237,7 +2410,8 @@ if barstate.islast
             // cena právě v zóně: aktuální (i tvořící se) svíčka zasahuje do zóny → jiná barva
             z.tap := zoneTapHi and high >= z.bot and low <= z.top
             if want
-                int x1 = z.isSP or z.isAuto ? math.min(math.max(nz(z.x0, xL), xL), bar_index) : xL
+                // single print od svého vzniku (max. SP_BACK zpět), auto level od začátku session (nejdřív xL)
+                int x1 = z.isSP ? math.min(math.max(nz(z.x0, xL), bar_index - SP_BACK, 0), bar_index) : z.isAuto ? math.min(math.max(nz(z.x0, xL), xL), bar_index) : xL
                 if z.isSP
                     spDraw(z, x1, xR)
                 else
@@ -2252,6 +2426,53 @@ if barstate.islast
             clDraw(zc, math.min(math.max(nz(zc.x0, xL), xL), bar_index), xR)
         else
             zErase(zc)
+    // TPO profily: smazat a nakreslit znovu (posledních tpN hotových + tvořící se okno)
+    for pl in tpPolys
+        pl.delete()
+    tpPolys.clear()
+    for lb in tpLbls
+        lb.delete()
+    tpLbls.clear()
+    if tpOn
+        array<TpoProf> show = array.new<TpoProf>()
+        int nP = tpProfs.size()
+        if nP > 0
+            for i = math.max(nP - tpN, 0) to nP - 1
+                show.push(tpProfs.get(i))
+        // tvořící se okno: uzavřené svíčky okna + aktuální svíčka (pokud ještě není uzavřená a patří do okna)
+        bool hasLive = false
+        if tpLive and spWH.size() > 0
+            array<float> lh = spWH.copy()
+            array<float> ll = spWL.copy()
+            if not conf and spWk == spWKey
+                lh.push(high)
+                ll.push(low)
+            TpoProf lp = tpoBuild(lh, ll, spStep, spWBar, spWKey * spWin * 60000)
+            if not na(lp)
+                show.push(lp)
+                hasLive := true
+        int nS = show.size()
+        if nS > 0
+            if tpPlace == "Vpravo vedle ceny"
+                // od nejnovějšího dozadu, kolik se vejde do TP_ROOM svíček za poslední svíčkou; kreslí se zleva
+                int used  = 0
+                int first = nS
+                for j = nS - 1 to 0
+                    int wj = show.get(j).mx * tpW + tpGap
+                    if tpOff + used + wj > TP_ROOM
+                        break
+                    used  += wj
+                    first := j
+                int x = bar_index + tpOff
+                if first < nS
+                    for j = first to nS - 1
+                        TpoProf p = show.get(j)
+                        tpoDraw(tpPolys, tpLbls, p, x, hasLive and j == nS - 1)
+                        x += p.mx * tpW + tpGap
+            else
+                for j = 0 to nS - 1
+                    TpoProf p = show.get(j)
+                    tpoDraw(tpPolys, tpLbls, p, p.x0, hasLive and j == nS - 1)
 
 // ───────── Tečky rejection wicků (jen uzavřené svíčky v session) ─────────
 float dotOff  = DOT_OFF * atrN
