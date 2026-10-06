@@ -1,0 +1,2398 @@
+//@version=6
+indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  1m Price Action Asistent · V4b
+//  Struktura = ATR-zigzag: range = poslední swing low → poslední swing high (wicky).
+//  Swing se potvrdí až pullbackem ≥ × ATR → drobné swingy range nemění, range se ale
+//  obnovuje s každým skutečným swingem. Displacement = 1m CLOSE za swing high / low
+//  → price discovery → retap. FAIL = close zpět za prolomenou hranou o ≥ max(tolerance,
+//  × ATR) → failed high / low = nová hrana.
+//  Zóny = moje obdélníky (text) + auto levely + single prints (každé 30min okno = profil
+//  z 1m svíček; single print = cena, přes kterou v okně prošla jen jedna 1m svíčka; platí
+//  přes dny až do vyplnění). Boxy zón se kreslí jen blízko ceny (jinak by roztáhly osu).
+//  Vzhled: tečky = rejection wicky, ↑↓ = displacement, ▲▼ = entry, × = FAIL,
+//  ◆ = respect zóny, ◇ = první dotek po RUN, ◈ = SMT divergence. Na grafu žádný text – detaily v tooltipu (najeď myší).
+//  Stav = tečka vpravo. Vše jen na UZAVŘENÉ svíčce → žádný repaint. "b." = body.
+//  Barvy, průhlednosti, znaky a velikosti = JEDINÁ sekce „VZHLED“ (u vstupů níže).
+//  Backtest (volitelný, skupina Backtest): simulace nakreslených entry → tabulka statistik podle typu entry.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────── Konstanty ─────────
+TZ         = "America/New_York"
+MAX_RET    = 12      // max. současně čekajících retapů
+MAX_ZONES  = 150     // max. ručních zón (obdélníků)
+MAX_HIST   = 40      // max. minulých range boxů
+MAX_EVT    = 250     // max. značek událostí (šipky, kosočtverce, křížky)
+MAX_DEAD   = 80      // max. ukončených čar retapů
+MAX_OPEN   = 10      // max. čar Open (posledních sessions)
+MAX_SPDONE = 30      // max. vyplněných (zesvětlených) single prints v historii
+SP_MAXROWS = 2000    // max. řádků jednoho okna (větší rozsah = okno se přeskočí)
+// Backtest (skupiny statistik: 0–5 typy entry, pak souhrny)
+BT_NK      = 6       // typy entry: 0 RETAP·DISP, 1 RETAP·ZÓNA, 2 WICK·SWING, 3 WICK·ZÓNA, 4 DISP, 5 RUN
+BT_TOT     = 6       // CELKEM
+BT_LONG    = 7
+BT_SHORT   = 8
+BT_TREND   = 9       // trend dny
+BT_RANGE   = 10      // range dny
+BT_B0      = 11      // časová okna 11–14 (9:30–10:30, 10:30–12:00, 12:00–14:00, 14:00–16:00)
+BT_BX      = 15      // vstup mimo 9:30–16:00 (jen vlastní session)
+BT_SMT     = 16      // entry se souhlasným SMT před vstupní svíčkou
+BT_NOSMT   = 17
+BT_NG      = 18      // počet skupin
+BT_NT      = 9       // cíle 1, 2, 3, 5, 10, 20, 30, 50, 100 R
+BT_TMAX    = 100.0   // největší cíl (R)
+BT_MAXOPEN = 60      // max. současně otevřených obchodů
+BT_MAXPEND = 400     // max. výsledků čekajících na typ dne
+BT_MAXDAYS = 5000    // max. klasifikovaných RTH sessions
+BT_COLS    = 18      // sloupce tabulky
+BT_ROWS    = 21      // řádky tabulky (pevné pozice)
+
+G1 = "Session & bias"
+G2 = "Risk"
+G3 = "Rejection wick"
+G4 = "Struktura"
+G5 = "Displacement & retap"
+G6 = "Zóny"
+GS = "Single prints"
+G7 = "Volatilita"
+G8 = "Zobrazení"
+GV = "Vzhled"
+GP = "Mini panel"
+GB = "Backtest"
+G9 = "Alerty"
+GM = "SMT"
+MAX_SMT = 60
+SMT_HISTORY = 3000
+
+// ═════════════════════════════ VSTUPY ═════════════════════════════
+// G1 – Session & bias
+sessStr         = input.session("0930-1600", "Session (NY čas)", tooltip="Obchodní okno v newyorském čase (America/New_York – letní čas se řeší automaticky). 09:30 NY = 15:30 v ČR (jen v týdnech, kdy USA a EU mění čas v jiný den, 14:30). Struktura, události a entry se značí jen uvnitř session.", group=G1, display=display.none)
+bias            = input.string("Oba", "Bias", options=["Long", "Short", "Oba"], tooltip="Denní bias. Entry proti biasu se nekreslí (nebo jen šedě – viz níže). Při biasu Oba a současném long i short signálu na jedné svíčce se entry nekreslí (chop).", group=G1, display=display.none)
+showAgainstBias = input.bool(false, "Ukázat i entry proti biasu (šedě)", tooltip="Entry proti biasu kreslit šedým trojúhelníkem – bez alertu.", group=G1, display=display.none)
+
+// G2 – Risk
+stopPts    = input.float(15.0, "Stop (body)", minval=0.25, step=0.25, tooltip="Stop v bodech (cenové jednotky). Typicky 15, někdy 10.", group=G2, display=display.none)
+rr         = input.float(2.0, "TP (násobek R)", minval=0.5, step=0.25, tooltip="TP = entry ± tento násobek rizika (R = vzdálenost entry–SL).", group=G2, display=display.none)
+slMode     = input.string("Fixní stop", "SL režim", options=["Fixní stop", "Za wick/level"], tooltip="Fixní stop: SL vždy ve vzdálenosti stopu od entry. Za wick/level: SL za wick svíčky (u retapu za level / invalidaci) + buffer – tooltip entry upozorní, když je SL větší než stop.", group=G2, display=display.none)
+slBufTicks = input.int(2, "Buffer za wick (ticky)", minval=0, tooltip="Kolik ticků za wick / level dát SL v režimu Za wick/level. Stejný buffer se přičítá při kontrole, zda se wick / svíčka vejde do stopu.", group=G2, display=display.none)
+
+// G3 – Rejection wick
+wickPct     = input.float(0.5, "Min. podíl wicku na svíčce", minval=0.3, maxval=0.95, step=0.05, tooltip="Rejection wick musí tvořit aspoň tento podíl celé svíčky (high–low). 0.5 = polovina svíčky. Když mají velký wick obě strany = nerozhodnost, neznačí se.", group=G3, display=display.none)
+wickAtrMult = input.float(0.35, "Min. wick × ATR", minval=0.0, step=0.05, tooltip="Wick musí být aspoň tento násobek ATR – odfiltruje drobné svíčky v klidném trhu.", group=G3, display=display.none)
+wickMinPts  = input.float(2.0, "Min. wick (body)", minval=0.0, step=0.25, tooltip="Absolutní minimum délky wicku v bodech.", group=G3, display=display.none)
+volLen      = input.int(20, "Objem – průměr (svíčky)", minval=2, tooltip="Délka průměru objemu pro relativní objem.", group=G3, display=display.none)
+volMult     = input.float(1.5, "Vysoký objem × průměr", minval=1.0, step=0.1, tooltip="Rejection wick s objemem ≥ tento násobek průměru dostane plnou tečku (při volbě teček Všechny).", group=G3, display=display.none)
+
+// G4 – Struktura (ATR-zigzag swingy)
+orBars        = input.int(1, "Opening range (svíčky od 9:30)", minval=1, maxval=30, tooltip="První range session = high/low prvních N minutových svíček od startu session (wick-to-wick). 1 = svíčka 9:30. Do uzavření opening range se displacement neznačí.", group=G4, display=display.none)
+pullAtr       = input.float(2.0, "Swing = pullback ≥ × ATR", minval=0.2, step=0.1, tooltip="Swing high / low se potvrdí, až se cena od extrému vrátí aspoň o tento násobek ATR (ATR-zigzag). Range = poslední swing low → poslední swing high (wicky). Drobné swingy pod prahem range nemění. Menší číslo = range se obnovuje častěji.", group=G4, display=display.none)
+pullMinPts    = input.float(0.0, "… a zároveň ≥ body", minval=0.0, step=0.25, tooltip="Minimální pullback v bodech i v klidném trhu (0 = jen podle ATR).", group=G4, display=display.none)
+failAtr       = input.float(0.3, "FAIL až při návratu o ≥ × ATR", minval=0.0, step=0.05, tooltip="Po displacementu: FAIL (failed displacement) až když svíčka uzavře zpět za prolomenou hranou o víc než max(tolerance retapu, tento násobek ATR). Na 1m s ATR 20 b. a 0.3 = 6 b. – odfiltruje šum hned po průrazu. Failed high / low se pak stane novou hranou range.", group=G4, display=display.none)
+midPct        = input.float(40.0, "Střed range = chop (% šířky)", minval=0.0, maxval=90.0, tooltip="Prostřední pásmo range (v % jeho šířky) = chop – tam nevstupovat, čekat na hranu nebo na displacement. Používá se v textu stavové tečky.", group=G4, display=display.none)
+showRangeBox  = input.bool(true, "Kreslit range box", tooltip="Aktuální range = poslední swing low → poslední swing high (wick-to-wick): jemný tečkovaný box se slabou středovou čárou. Displacement = 1m close za boxem; pak box zmizí a tečkovaná čára ukazuje rozvíjející se extrém (price discovery), dokud pullback nepotvrdí nový swing.", group=G4, display=display.none)
+showRangeHist = input.bool(true, "Nechat minulé range (slabě)", tooltip="Při změně range (nový swing, displacement, konec session) zůstane starý range jako velmi slabý box (max. 40 posledních).", group=G4, display=display.none)
+
+// G5 – Displacement & retap
+requireStrong = input.bool(false, "Displacement jen silnou svíčkou", tooltip="Vypnuto: displacement = jakýkoli 1m CLOSE za swing high / low. Zapnuto: navíc silná svíčka (velké tělo i rozsah vůči ATR); slabý close za hranou se ignoruje (hrana platí dál).", group=G5, display=display.none)
+strongBodyPct = input.float(0.6, "Silná svíčka – min. tělo (% svíčky)", minval=0.1, maxval=1.0, step=0.05, tooltip="Tělo silné svíčky musí tvořit aspoň tento podíl jejího rozsahu.", group=G5, display=display.none)
+strongAtr     = input.float(1.2, "Silná svíčka – min. velikost × ATR", minval=0.1, step=0.1, tooltip="Rozsah silné svíčky musí být aspoň tento násobek ATR. Tooltip displacementu uvádí „silná svíčka“.", group=G5, display=display.none)
+retapBars     = input.int(20, "Retap platí max (svíček)", minval=1, tooltip="Kolik svíček po displacementu / reakci zóny čekat na retap levelu (a hlídat FAIL displacementu). Potom retap vyprší (čárkovaná čára zmizí).", group=G5, display=display.none)
+retapTol      = input.float(1.0, "Tolerance retapu (body)", minval=0.0, step=0.25, tooltip="Retap platí, když se cena k levelu přiblíží na tuto vzdálenost a svíčka uzavře na správné straně. Retap po displacementu: entry = level, když se na něm obchodovalo; jinak hrana tolerance – nikdy lepší než open svíčky. Retap zóny / single printu: entry na close, rejection podle volby Retap zóny → entry jen s rejection svíčkou. FAIL po displacementu: close zpět za prolomenou hranou o víc než max(tato tolerance, FAIL × ATR) – značka ×. Retap zóny: zruší se tiše při close za druhou hranou zóny.", group=G5, display=display.none)
+entryMode     = input.string("Displacement + Retap", "Entry na", options=["Displacement + Retap", "Jen Retap", "Jen Displacement"], tooltip="Displacement = entry na close svíčky, která uzavře za swing high / low – jen když stop za low / high svíčky (+ buffer) ≤ stop, jinak se čeká na retap. Retap = entry při návratu na prolomenou hranu (lepší fill).", group=G5, display=display.none)
+wickEntries   = input.bool(true, "Entry proti rejection wicku (hrana range / zóna)", tooltip="Navrhovat entry proti rejection wicku: wick vybere swing high / low a svíčka uzavře zpět, nebo rejection při respektu zóny / single printu. Jen když wick (+ buffer) ≤ stop.", group=G5, display=display.none)
+entryGap      = input.int(5, "Min. odstup entry stejného směru (svíčky)", minval=0, maxval=100, tooltip="Nové entry stejného směru (long / short) se nakreslí až aspoň tolik svíček po minulém nakresleném entry toho směru – žádné shluky entry minutu po minutě. 0 = bez omezení.", group=G5, display=display.none)
+
+zoneRetapRej = input.bool(true, "Retap zóny → entry jen s rejection svíčkou", tooltip="Zapnuto: entry na retapu zóny potřebuje rejection svíčku. Vypnuto: stačí dotek a close na správné straně, entry na close. Značka ◇ po RUN pouze ukazuje první dotek; není to entry. Retapy DISP se nemění.", group=G5, display=display.none)
+
+// G6 – Zóny
+zonesTxt       = input.text_area("", "Moje zóny", tooltip="Moje obdélníky jako text (Pine neumí číst kresby). Formát: top-bottom, zóny oddělené středníkem ; nebo novým řádkem, max. 150. Příklad: 21550-21540; 21480.5-21472. Jedno číslo = zóna ± šířka níže. Desetinná čárka je OK (21550,25) – čárku proto nepoužívej jako oddělovač zón.", group=G6, display=display.none)
+zoneHalf       = input.float(2.0, "Šířka zóny z jedné ceny (± body)", minval=0.0, step=0.25, tooltip="Když zadáš jen jednu cenu, zóna bude cena ± tato hodnota.", group=G6, display=display.none)
+zonesTodayOnly = input.bool(false, "Moje zóny vyhodnocovat jen dnešní den", tooltip="Vypnuto (výchozí): moje zóny jsou vícedenní levely jako obdélníky v grafu – vyhodnocují se každý den (kreslí se jen blízko ceny, viz níže). Zapnuto: jen aktuální obchodní den (podle skutečného času; po 18:00 NY = další den), před open se jen kreslí.", group=G6, display=display.none)
+useAuto        = input.bool(true, "Automatické levely (PDH/PDL, ONH/ONL, Open 9:30)", tooltip="Auto zóny: PDH/PDL = high/low předchozí RTH session (9:30–16:00 NY), ONH/ONL = overnight high/low (jen když graf má ETH data), OPEN = open první svíčky session.", group=G6, display=display.none)
+autoHalf       = input.float(1.0, "Šířka auto levelů (± body)", minval=0.0, step=0.25, tooltip="Auto level se kreslí jako zóna cena ± tato hodnota.", group=G6, display=display.none)
+showZones      = input.bool(true, "Kreslit zóny", tooltip="Boxy zón: moje zóny (velmi slabě), auto levely (neutrálně), bez textu. Respect = okraj v barvě směru, run-through = čárkovaný okraj. Kreslí se jen zóny blízko ceny (viz níže). Auto levely jen během session (mimo ni jsou levely příští session v tooltipu stavové tečky). Single prints mají vlastní volbu.", group=G6, display=display.none)
+zoneRunEntries = input.bool(false, "Entry na RUN skrz zónu", tooltip="Navrhovat entry hned na close svíčky, která proběhne skrz zónu / single print. Výchozí vypnuto – RUN jen připraví retap (entry až na retapu).", group=G6, display=display.none)
+zoneCool       = input.int(10, "Klid zóny po události (svíčky)", minval=0, maxval=200, tooltip="Po respectu nebo run-through zóny / single printu se další události téže zóny tolik svíček ignorují (cena, která se přelévá sem a tam přes zónu, nedělá RUN / FAIL / retap ping-pong). Strana ceny vůči zóně se dál sleduje.", group=G6, display=display.none)
+zoneShowPts    = input.float(0.0, "Kreslit zóny do vzdálenosti (body, 0 = všechny)", minval=0.0, step=5.0, tooltip="0 = kreslit VŠECHNY zóny a single prints. Aby vzdálené zóny neroztahovaly cenovou osu, zapni v TradingView: pravý klik na cenovou osu → Scale price chart only (osa se pak řídí jen svíčkami). Číslo > 0 = kreslit jen zóny do této vzdálenosti od ceny. Vyhodnocují se vždy všechny zóny – tohle je jen kresba.", group=G6, display=display.none)
+zoneBack       = input.int(390, "Boxy zón doleva (svíčky)", minval=10, maxval=5000, tooltip="Boxy zón začínají tolik svíček před poslední svíčkou (390 = jedna RTH session na 1m) a končí kousek vpravo od ceny – bez prodloužení přes celý graf. Single prints a auto levely začínají nejdřív svým vznikem.", group=G6, display=display.none)
+
+// GS – Single prints (TPO)
+useSP            = input.bool(true, "Single prints (TPO)", tooltip="Single prints jako indikátor Single Prints [Sim] (Profile aggregation 30, Build from 1): každé okno (výchozí 30 min, :00 a :30) je samostatný profil z 1m svíček. Single print = cena, přes kterou v okně prošla jen jedna 1m svíčka (rychlý průlet), mezi řádky s ≥ 2 svíčkami (okraje okna se nepočítají). Vznikne na konci okna a platí, dokud se na té ceně znovu neobchoduje. Nevyplněné single prints fungují jako zóny (respect / run-through / retap / entry / alerty) s názvem SP. Počítá se na 1m grafu.", group=GS, display=display.none)
+spWin            = input.int(30, "Okno profilu (min)", minval=5, maxval=240, tooltip="Délka okna, ze kterého se staví jeden profil z 1m svíček (Single Prints [Sim]: Profile aggregation = 30).", group=GS, display=display.none)
+spStepNQ         = input.float(1.0, "Krok NQ/MNQ (body)", minval=0.25, step=0.25, tooltip="Výška řádku profilu pro NQ / MNQ v bodech (1.00 = 4 ticky).", group=GS, display=display.none)
+spStepOtherTicks = input.int(1, "Krok ostatní (ticky)", minval=1, tooltip="Výška řádku profilu pro ostatní symboly v ticích (ES / MES: 1 tick = 0.25).", group=GS, display=display.none)
+spTails          = input.bool(false, "Včetně tailů (single prints na okraji profilu)", tooltip="Vypnuto (výchozí): jen vnitřní single prints – nad i pod nimi musí být řádek s aspoň 2 TPO. Zapnuto: i buying / selling tail na okraji profilu.", group=GS, display=display.none)
+spMinRows        = input.int(1, "Min. délka single print (řádky)", minval=1, tooltip="Single print kratší než tento počet řádků se při vzniku ignoruje (zbytky po částečném vyplnění zůstávají).", group=GS, display=display.none)
+spMax            = input.int(40, "Max. nevyplněných single prints", minval=5, maxval=100, tooltip="Kolik nevyplněných single prints držet; při překročení se zahodí nejvzdálenější od ceny.", group=GS, display=display.none)
+spShow           = input.bool(true, "Kreslit single prints", tooltip="Nevyplněný single print = tenký box (1 řádek = čára) od TPO periody vzniku po poslední svíčku – jen blízko ceny (viz Zóny). Řádek je vyplněný, jakmile se na jeho ceně obchoduje; vyplněná část končí na svíčce vyplnění a zesvětlí se (posledních 30).", group=GS, display=display.none)
+
+// G7 – Volatilita
+atrLen     = input.int(14, "ATR délka", minval=1, tooltip="Hlavní ATR pro filtr wicků, silnou svíčku, swingy a volatilitu.", group=G7, display=display.none)
+atrFastLen = input.int(5, "ATR rychlé", minval=1, tooltip="Rychlé ATR pro expanzi / kompresi.", group=G7, display=display.none)
+atrSlowLen = input.int(30, "ATR pomalé", minval=2, tooltip="Pomalé ATR. Rychlé / pomalé > 1.3 = expanze, < 0.75 = komprese.", group=G7, display=display.none)
+volHiThr   = input.float(1.5, "Vysoká vol.: stop < × ATR", step=0.1, tooltip="Vysoká volatilita, když je stop menší než tento násobek ATR – svíčky jsou vůči stopu velké, hrozí vyhození.", group=G7, display=display.none)
+volLoThr   = input.float(3.0, "Nízká vol.: stop > × ATR", step=0.1, tooltip="Nízká volatilita, když je stop větší než tento násobek ATR – pomalý trh, cesta k TP může trvat.", group=G7, display=display.none)
+
+// G8 – Zobrazení
+rejDots        = input.string("Všechny", "Tečky rejection wicků", options=["Všechny", "Jen u hran", "Vypnuto"], tooltip="Tečka u špičky rejection wicku. Malá slabá • = běžný wick. Plná ● = wick u hrany: vybral swing high / low a svíčka uzavřela zpět, rejection na novém extrému v price discovery, respect zóny / single printu (u volby Všechny i vysoký objem). Jen u hran = jen ty důležité.", group=G8, display=display.none)
+showEntryLines = input.bool(true, "Čáry Entry / SL / TP", tooltip="U entry krátké tenké čáry: entry (modrá plná), SL (červená tečkovaná), TP (zelená tečkovaná).", group=G8, display=display.none)
+entryLineBars  = input.int(12, "Délka čar (svíčky)", minval=3, maxval=300, tooltip="Délka čar entry / SL / TP ve svíčkách.", group=G8, display=display.none)
+maxEntryDraw   = input.int(40, "Max. entry na grafu", minval=1, maxval=80, tooltip="Kolik posledních entry nechat na grafu (starší se smažou).", group=G8, display=display.none)
+showOpenLine   = input.bool(true, "Čára Open 9:30", tooltip="Slabá tečkovaná čára na open první svíčky session.", group=G8, display=display.none)
+showStatus     = input.bool(true, "Stavová tečka", tooltip="Tečka vpravo od poslední svíčky. Barva = kontext: šedá range, zelená price discovery ↑ / čeká long retap, červená ↓ / čeká short retap. Najetím myší kompletní stav: range, volatilita, bias, zóny, single prints, retap, poslední entry.", group=G8, display=display.none)
+showText       = input.bool(false, "Krátké popisky u značek", tooltip="Ke značkám přidat drobný text (DISP, RETAP, FAIL, RUN Z1 …). Výchozí: jen symboly, detaily v tooltipu.", group=G8, display=display.none)
+showZoneRun    = input.bool(true, "Značky RUN skrz zónu", tooltip="Šipka ↑↓ i u run-through zóny / single printu. Výchozí zapnuto: RUN šipka ukazuje průraz zóny a připraví retap (čárkovaná čára). Informace o RUN je i tak v tooltipu ostatních značek a v alertu.", group=G8, display=display.none)
+
+// SMT – srovnání na stejném timeframe, pouze uzavřené svíčky
+smtOn = input.bool(true, "SMT divergence", tooltip="Divergence při prvním průrazu potvrzeného swingu jedním z trhů. ◈ není entry ani filtr vstupů.", group=GM, display=display.none)
+smtSym = input.symbol("CME_MINI:MES1!", "Srovnávací symbol", tooltip="Druhý trh pro SMT, výchozí MES1! proti NQ/MNQ. Na ES lze zvolit NQ1!.", group=GM, display=display.none)
+smtWin = input.int(2, "Okno pro extrém druhého trhu (± svíčky)", minval=0, maxval=5, tooltip="Extrém druhého trhu v okolí swingu. Vyhodnocení začne až po uzavření celého okna; bez budoucích dat.", group=GM, display=display.none)
+smtMin = input.float(0.1, "SMT min. přestřelení", minval=0.0, step=0.05, tooltip="Násobek ATR trhu, který vytvoří nový extrém. Minimum = max(2 ticky tohoto trhu, tato hodnota × jeho ATR). Druhý trh musí zůstat aspoň 1 svůj tick před swingem. ATR délka podle skupiny Volatilita. Protichůdné SMT na stejné svíčce se vynechají.", group=GM, display=display.none)
+smtLook = input.int(15, "SMT platí pro entry (svíček)", minval=1, tooltip="Backtest: s SMT = stejný směr a SMT na některé z předchozích 1 až N svíček. SMT na samotné vstupní svíčce se nepočítá.", group=GM, display=display.none)
+
+// ═══ VZHLED START ═══ (barvy, značky, průhlednosti)
+// Jediné místo pro vzhled indikátoru. Mimo tuto sekci nejsou v kódu žádné barvy, čísla průhlednosti,
+// znaky značek ani jejich velikosti – vše se odvozuje odsud přes color.new(barva, průhlednost).
+// Průhlednost: 0 = plná barva … 100 = neviditelná.
+// ── Základní barvy (vstupy, skupina Vzhled)
+cBull  = input.color(#347F76, "Bull / long", tooltip="Bull rejection, displacement ↑, long entry, TP.", group=GV, display=display.none)
+cBear  = input.color(#AD5966, "Bear / short", tooltip="Bear rejection, displacement ↓, short entry, SL, short retap.", group=GV, display=display.none)
+cNeut  = input.color(#596B80, "Neutrální", tooltip="Range, auto levely a jejich značky (◆ respect, ↑↓ run-through), FAIL, Open, stav mimo session.", group=GV, display=display.none)
+cRetap = input.color(#527BA6, "Retap / entry čára", tooltip="Čekající long retap a čára entry.", group=GV, display=display.none)
+cZone  = input.color(#376B89, "Moje zóny", tooltip="Ruční zóny a jejich značky (◆ respect, ↑↓ run-through).", group=GV, display=display.none)
+cSP    = input.color(#A57438, "Single prints", tooltip="Single prints a jejich značky (◆ respect, ↑↓ run-through).", group=GV, display=display.none)
+// ── Znaky značek (textové glyfy bez pozadí) a velikosti
+GL_LONG    = "▲"          // entry long (pod svíčkou)
+GL_SHORT   = "▼"          // entry short (nad svíčkou)
+GL_UP      = "↑"          // displacement ↑ / RUN ↑ (pod svíčkou)
+GL_DN      = "↓"          // displacement ↓ / RUN ↓ (nad svíčkou)
+GL_FAIL    = "×"          // FAIL na prolomeném levelu
+GL_ZRETAP  = "◇"          // první dotek zóny po RUN, není entry
+GL_SMT     = "◈"          // SMT divergence
+GL_RESP    = "◆"          // RESPECT zóny na její hraně
+GL_DOT     = "•"          // běžný rejection wick
+GL_DOT_BIG = "●"          // rejection u hrany / vysoký objem
+SZ_MARK    = size.tiny    // velikost glyfů (entry, DISP, RUN, FAIL, RESPECT)
+SZ_DOT     = size.tiny    // velikost teček rejection wicků
+SZ_STATUS  = size.tiny    // stavová tečka vpravo
+SZ_ZTEXT   = size.tiny    // název zóny uvnitř boxu
+SZ_PANEL_S = size.tiny    // mini panel: volba Drobný
+SZ_PANEL_M = size.small   // mini panel: volba Malý
+SZ_PANEL_L = size.normal  // mini panel: volba Normální
+DOT_OFF    = 0.08        // odsazení tečky od špičky wicku (× ATR)
+// ── Styly a tloušťky čar
+W_LINE      = 1                    // tloušťka všech čar a okrajů boxů
+ST_RANGE    = line.style_dotted    // okraj range boxu, střed, rozvíjející se extrém
+ST_RETAP    = line.style_dashed    // čekající retap
+ST_ENTRY    = line.style_solid     // čára entry
+ST_ENTRY_AG = line.style_dotted    // čára entry proti biasu
+ST_SLTP     = line.style_dotted    // SL a TP
+ST_ZONE     = line.style_solid     // okraj zóny
+ST_ZONE_RUN = line.style_dashed    // okraj zóny po run-through
+ST_SP       = line.style_solid     // single print (box / čára)
+ST_SMT      = line.style_dotted
+ST_OPEN     = line.style_dotted    // Open 9:30
+// ── Průhlednosti: značky
+T_INVIS     = 100   // pozadí textových glyfů (neviditelné)
+T_AGAINST   = 50    // entry proti biasu (neutrální barva)
+T_DISP      = 15    // šipka displacementu
+T_ZRUN      = 15    // šipka RUN zóny / single printu (jen při Značky RUN)
+T_ZRETAP    = 5
+T_SMT       = 0
+T_SMT_LINE  = 15
+SMT_TXT     = "SMT"   // nápis uprostřed SMT čáry
+SMT_TXT_OFF = 0.35    // odsazení nápisu od čáry (× ATR)
+T_RESP      = 5    // kosočtverec RESPECT
+T_FAIL      = 5    // křížek FAIL
+T_DOT       = 30    // běžná tečka rejection wicku
+T_DOT_BIG   = 0    // výrazná tečka (hrana / objem)
+// ── Průhlednosti: entry čáry
+T_ELINE     = 10    // entry
+T_ELINE_AG  = 70    // entry proti biasu
+T_SLTP      = 15    // SL / TP
+T_SLTP_AG   = 75    // SL / TP proti biasu
+// ── Průhlednosti: range a retap
+T_RANGE_BRD = 20    // okraj aktuálního range
+T_RANGE_BG  = 92    // výplň aktuálního range
+T_RANGE_MID = 65    // středová čára range
+T_HIST_BRD  = 75    // okraj minulého range
+T_HIST_BG   = 97    // výplň minulého range
+T_DEV       = 70    // rozvíjející se extrém v price discovery
+T_RETAP_L   = 20    // čekající long retap
+T_RETAP_S   = 20    // čekající short retap
+T_RETAP_END = 75    // ukončená čára retapu (vystřelil / FAIL)
+T_OPEN      = 70    // čára Open
+// ── Průhlednosti: zóny a single prints
+T_ZONE_BRD  = 45    // okraj ruční zóny
+T_ZONE_BG   = 88    // výplň ruční zóny
+T_ZONE_TXT  = 35    // název ruční zóny
+T_AUTO_BRD  = 60    // okraj auto levelu
+T_AUTO_BG   = 95    // výplň auto levelu
+T_AUTO_TXT  = 40    // název auto levelu
+T_ZONE_RESP = 55    // okraj zóny po respectu (barva směru)
+T_ZONE_RUN  = 70    // okraj zóny po run-through (neutrální)
+T_SP_BRD    = 20    // okraj single printu
+T_SP_BG     = 90    // výplň single printu
+T_SP_LINE   = 20    // 1řádkový single print (čára)
+T_SPDONE    = 80    // vyplněný single print (okraj / čára)
+T_SPDONE_BG = 95    // vyplněný single print (výplň)
+// ── Průhlednosti: stav a mini panel
+T_STAT      = 0    // stavová tečka v session (range / long / short)
+T_STAT_OFF  = 50    // stavová tečka mimo session
+T_PANEL_BG  = 90    // pozadí mini panelu
+T_PANEL_FRM = 80    // rámeček mini panelu
+T_PANEL_KEY = 25    // popisky v mini panelu
+// ── Backtest tabulka (jen při Statistika entry; barvy = Neutrální, Σ R / EV = Bull / Bear)
+SZ_BT       = size.tiny   // velikost textu tabulky backtestu
+T_BT_BG     = 88    // pozadí tabulky
+T_BT_FRM    = 80    // rámeček tabulky
+T_BT_HEAD   = 0     // záhlaví a názvy sloupců
+T_BT_TXT    = 10    // hodnoty (neutrální)
+T_BT_SEC    = 80    // podklad řádku CELKEM
+T_BT_FOOT   = 40    // patička (poznámky)
+// ═══ VZHLED END ═══
+
+// Mini panel (volitelný)
+showTable = input.bool(false, "Mini panel", tooltip="Volitelný malý panel: Kontext, Range, Volatilita, Bias. Výchozí vypnuto – celý stav je v tooltipu stavové tečky.", group=GP, display=display.none)
+tablePos  = input.string("Vpravo nahoře", "Pozice panelu", options=["Vpravo nahoře", "Vpravo dole", "Vlevo nahoře", "Vlevo dole"], tooltip="Kde na grafu má panel být.", group=GP, display=display.none)
+txtSize   = input.string("Malý", "Velikost textu panelu", options=["Drobný", "Malý", "Normální"], tooltip="Velikost textu mini panelu.", group=GP, display=display.none)
+
+// GB – Backtest (volitelná statistika entry; vypnuto = indikátor se nijak nemění)
+btOn       = input.bool(false, "Statistika entry (backtest)", tooltip="Zapnuto: každé NAKRESLENÉ entry ve směru biasu se simuluje se stejným entry / SL / TP jako na grafu (u RETAP·DISP entry na close svíčky retapu – signál existuje až po close; bez pohledu do budoucna – vyhodnocení od další svíčky) a ukáže se tabulka: typ entry, LONG / SHORT, trend / range dny, časová okna. Fixní TP (TP násobek R) i MFE a cíle 1–100R (dosaženo % a EV). Statistika běží na datech, která má graf. Vypnuto (výchozí): nic se nemění.", group=GB, display=display.none)
+btMode     = input.string("Všechny signály", "Režim", options=["Všechny signály", "Jedna pozice naráz"], tooltip="Všechny signály: každé nakreslené entry = samostatný obchod (nejlepší pro srovnání typů entry). Jedna pozice naráz: nové entry se přeskočí, dokud je otevřený předchozí obchod (otevřený = do SL, časového výstupu nebo 100R – ne jen do fixního TP).", group=GB, display=display.none)
+btCost     = input.float(0.5, "Náklady na obchod (body, tam i zpět)", minval=0.0, step=0.25, tooltip="Komise + skluz v bodech za celý obchod. Odečte se od každého výsledku v R: R = (výstup − entry) / riziko − náklady / riziko.", group=GB, display=display.none)
+btSameBar  = input.string("SL první", "SL i TP ve stejné svíčce", options=["SL první", "TP první"], tooltip="Když jedna svíčka zasáhne SL i TP / cíl: SL první = konzervativní (extrém svíčky ve prospěch se nepočítá), TP první = optimistické (extrém se započítá, pak SL obchod ukončí). Výstup vždy přesně na SL / TP, i při gapu přes ně (gap přes SL = SL hned, extrém ve prospěch se nepočítá; žádný skluz navíc mimo náklady).", group=GB, display=display.none)
+btExit     = input.string("Do Asie (čas NY)", "Neuzavřený obchod", options=["Do Asie (čas NY)", "Konec session", "Po N svíčkách", "Bez limitu"], tooltip="Obchod bez SL se uzavře: Do Asie = close první svíčky v / po čase výstupu (výchozí 20:00 NY = Tokio) v den vstupu; když v ten čas svíčka není (graf jen RTH, pátek před víkendem, svátek) → close poslední svíčky před ním. Konec session = close poslední svíčky session. Po N svíčkách = close N-té svíčky po vstupu. Bez limitu = drží se do SL nebo 100R. Časové výstupy nejsou výhra ani ztráta, jejich R je ale v součtech.", group=GB, display=display.none)
+btExH      = input.int(20, "Čas výstupu NY – hodina", minval=0, maxval=23, inline="btx", group=GB, display=display.none)
+btExM      = input.int(0, "min.", minval=0, maxval=59, inline="btx", tooltip="Čas výstupu pro režim Do Asie (NY čas, výchozí 20:00 = otevření Tokia). Vstup po tomto čase → výstup v tento čas další den.", group=GB, display=display.none)
+btMaxBars  = input.int(60, "N svíček", minval=1, tooltip="Počet svíček po vstupu pro režim Po N svíčkách (výstup na close).", group=GB, display=display.none)
+btTrendThr = input.float(0.5, "Trend day: |close−open| ≥ × rozsah", minval=0.05, maxval=1.0, step=0.05, tooltip="Typ dne podle RTH session (9:30–16:00 NY), určí se po jejím skončení: trend day, když |close − open| ≥ tento podíl rozsahu high − low, jinak range day. Obchod patří k session svého vstupu.", group=GB, display=display.none)
+btTblPos   = input.string("Vpravo dole", "Pozice tabulky", options=["Vpravo nahoře", "Vpravo dole", "Vlevo nahoře", "Vlevo dole"], tooltip="Kde na grafu má tabulka backtestu být (mini panel dej jinam, jinak se překryjí).", group=GB, display=display.none)
+
+// G9 – Alerty (v TradingView vytvoř alert s podmínkou „Any alert() function call“)
+alRej      = input.bool(false, "Alert: rejection wick", tooltip="Alert při každém rejection wicku v session.", group=G9, display=display.none)
+alDisp     = input.bool(true, "Alert: displacement", tooltip="Alert při 1m close za swing high / low (displacement).", group=G9, display=display.none)
+alZoneRetap = input.bool(true, "Alert: retap do zóny po RUN", tooltip="První dotek zóny po RUN, bez podmínky rejection. Není to entry.", group=G9, display=display.none)
+alSMT = input.bool(true, "Alert: SMT divergence", tooltip="První divergence na potvrzeném swingu, v obou směrech porovnání trhů.", group=G9, display=display.none)
+alZone     = input.bool(true, "Alert: zóna (respect / run-through)", tooltip="Alert při respect / run-through zóny nebo single printu.", group=G9, display=display.none)
+alRetapArm = input.bool(false, "Alert: retap připraven", tooltip="Alert, když se po displacementu / zóně začne čekat na retap.", group=G9, display=display.none)
+alEntry    = input.bool(true, "Alert: entry", tooltip="Alert při navrženém entry (ve směru biasu) včetně kontextu.", group=G9, display=display.none)
+alFail     = input.bool(false, "Alert: FAIL", tooltip="Alert při failed displacementu / ztrátě zóny.", group=G9, display=display.none)
+
+// ───────── Odvozená nastavení ─────────
+tsz          = txtSize == "Drobný" ? SZ_PANEL_S : txtSize == "Normální" ? SZ_PANEL_L : SZ_PANEL_M
+tPos         = tablePos == "Vpravo dole" ? position.bottom_right : tablePos == "Vlevo nahoře" ? position.top_left : tablePos == "Vlevo dole" ? position.bottom_left : position.top_right
+btTPos       = btTblPos == "Vpravo nahoře" ? position.top_right : btTblPos == "Vlevo nahoře" ? position.top_left : btTblPos == "Vlevo dole" ? position.bottom_left : position.bottom_right
+sessStartTxt = str.substring(sessStr, 0, 2) + ":" + str.substring(sessStr, 2, 4)
+bool  spIsNQ = str.contains(syminfo.root, "NQ")
+float spStep = math.max(spIsNQ ? spStepNQ : syminfo.mintick * spStepOtherTicks, syminfo.mintick)
+
+// ═════════════════════════════ DATOVÉ TYPY ═════════════════════════════
+// Zóna: ruční Z1.., auto PDH/PDL/ONH/ONL/OPEN, single print SP
+// lastOut: poslední strana close mimo zónu (+1 nad, -1 pod), prevS: strana minulého close (+1/0/-1)
+// state: 0 nic, ±1 respect, ±2 run-through; lastEvt: bar poslední události (klid zóny zoneCool)
+// bx / ln: kresba jen blízko ceny (vytváří / maže se na poslední svíčce)
+type Zone
+    float  top
+    float  bot
+    string name
+    bool   isAuto
+    box    bx
+    int    lastOut
+    int    prevS
+    int    lastEvt
+    int    state
+    bool   fresh  = true    // nový test zóny povolen (jeden test = jeden RESPECT)
+    bool   isSP   = false   // single print
+    float  st               // SP: krok řádků
+    int    x0               // SP: bar TPO periody vzniku · auto: první svíčka session (začátek kresby)
+    int    born             // SP: bar, kdy print vznikl (konec TPO periody)
+    line   ln               // SP: 1řádkový print = čára
+    int lastTapL = na       // poslední vykreslené ◇ long na této zóně
+    int lastTapS = na       // poslední vykreslené ◇ short na této zóně
+
+// Čekající retap (dir +1 long, -1 short); inval = close za touto cenou ho zruší
+type ZoneTap
+    float level
+    float inval
+    int start
+    string rangeText
+    color base
+    bool touched = false
+    Zone zoneRef           // stejná zóna i po sloučení retapu
+
+type SmtSwing
+    float price
+    int bar
+    float other = na
+    float since = na
+    float chartSince = na
+    bool ready = false
+    bool valid = true
+    bool chartSeen = false
+    bool otherSeen = false
+    bool fired = false
+
+type Retap
+    int    dir
+    float  level
+    float  inval
+    int    start
+    string src
+    line   ln
+    array<ZoneTap> taps
+
+// Kandidát na entry v rámci jedné svíčky (prio: RETAP 4 > PROTI WICKU 3 > RUN 2 > DISP 1)
+type Cand
+    int    dir
+    string typ
+    int    prio
+    float  entry
+    float  sp       // strukturální bod pro SL (bez bufferu)
+    string src
+
+// Kresby jednoho entry
+type EntryDraw
+    label lb
+    line  le
+    line  ls
+    line  lt
+
+// Vyplněný single print (zesvětlená kresba v historii)
+type SpDone
+    box  b
+    line l
+
+// Backtest: otevřený obchod (jen při btOn)
+type BtTrade
+    int   dir
+    int   kix              // typ entry 0–5 (BT_NK)
+    int   bkt              // skupina časového okna (BT_B0..BT_BX)
+    int   dayId            // index RTH session vstupu (typ dne)
+    float entry
+    float sl
+    float tp               // fixní TP (rr) z grafu
+    float risk
+    float costR            // náklady v R
+    int   ebar             // bar vstupu (vyhodnocení od dalšího)
+    int   xTs              // čas výstupu Do Asie
+    float mfe     = 0.0    // max. pohyb ve prospěch (R)
+    bool  fixDone = false  // fixní TP vyhodnocen
+    int   resFix  = 0      // 1 TP, -1 SL, 0 časový výstup
+    float rFix             // R při fixním TP (po nákladech)
+    bool withSMT = false
+
+// Backtest: výsledek uzavřeného obchodu, nebo (fixOnly) jen rozhodnutý fixní TP – i čekající na typ dne
+type BtRes
+    int   kix
+    int   dir
+    int   bkt
+    int   dayId
+    float mfe
+    int   endK             // konec: 0 čas, 1 SL, 2 dosažen největší cíl
+    float endR             // R výstupu bez nákladů
+    float costR
+    float rFix
+    int   resFix
+    bool withSMT = false
+    bool  fixOnly = false  // jen fixní TP (zapsaný, když se rozhodl) – čeká na typ dne; cíle přijdou při uzavření
+
+// ═════════════════════════════ POMOCNÉ FUNKCE ═════════════════════════════
+fp(float x) => na(x) ? "—" : str.tostring(x, format.mintick)
+fd(float x) => na(x) ? "—" : str.tostring(x, "#.##")
+am(string acc, string m) => acc == "" ? m : acc + " | " + m
+jn(string a, string b) => a == "" ? b : b == "" ? a : a + "\n" + b
+shortTyp(string t) => t == "PROTI WICKU" ? "WICK" : t
+// backtest: typ entry z vítězného kandidáta (prio 4 RETAP: zdroj s DISP → 0, jinak zóna 1; prio 3 PROTI WICKU:
+// zdroj "swing high/low …" → 2, jinak zóna / single print 3; prio 2 RUN zóny → 5; prio 1 DISP → 4)
+btKey(Cand c) => c.prio == 4 ? (str.contains(c.src, "DISP") ? 0 : 1) : c.prio == 3 ? (str.startswith(c.src, "swing") ? 2 : 3) : c.prio == 2 ? 5 : 4
+fR(float x) => na(x) ? "—" : (x > 0 ? "+" : "") + str.tostring(x, "0.00")
+// barva čáry retapu (long cRetap, short cBear); ended = ukončená (vystřelil / FAIL)
+rtCol(int d, bool ended) => d == 1 ? color.new(cRetap, ended ? T_RETAP_END : T_RETAP_L) : color.new(cBear, ended ? T_RETAP_END : T_RETAP_S)
+// cenový rozsah zóny (1řádkový single print = jedna cena)
+zRange(Zone z) => math.abs(z.top - z.bot) < syminfo.mintick * 0.5 ? fp(z.top) : fp(z.bot) + "–" + fp(z.top)
+
+// Značka = drobný znak (▲▼↑↓×◆) bez pozadí; pos: 1 nad svíčkou, -1 pod svíčkou, 0 na ceně
+glyph(float y, string g, string t, int pos, color c, string tip) =>
+    string txt = (showText and t != "") or t == "DISP" ? (pos == 1 ? t + "\n" + g : pos == -1 ? g + "\n" + t : g + " " + t) : g
+    label.new(bar_index, y, txt, xloc=xloc.bar_index, yloc=pos == 1 ? yloc.abovebar : pos == -1 ? yloc.belowbar : yloc.price, color=color.new(c, T_INVIS), style=label.style_none, textcolor=c, size=SZ_MARK, tooltip=tip)
+
+// Archiv ukončených čar s limitem
+pushDead(array<line> arr, line l) =>
+    if not na(l)
+        arr.push(l)
+        if arr.size() > MAX_DEAD
+            line.delete(arr.shift())
+    arr.size()
+
+// Značky s limitem
+pushLabel(array<label> arr, label lb, int cap) =>
+    if not na(lb)
+        arr.push(lb)
+        if arr.size() > cap
+            label.delete(arr.shift())
+    arr.size()
+
+// Styl boxu zóny podle stavu (single prints mají vlastní styl)
+styleZone(Zone z) =>
+    if not na(z.bx) and not z.isSP
+        color base = z.isAuto ? cNeut : cZone
+        bool  run  = z.state == 2 or z.state == -2
+        color bc   = z.state == 1 ? color.new(cBull, T_ZONE_RESP) : z.state == -1 ? color.new(cBear, T_ZONE_RESP) : run ? color.new(cNeut, T_ZONE_RUN) : color.new(base, z.isAuto ? T_AUTO_BRD : T_ZONE_BRD)
+        z.bx.set_border_color(bc)
+        z.bx.set_border_style(run ? ST_ZONE_RUN : ST_ZONE)
+    z.state
+
+// Nový box zóny x1..x2, bez textu
+zoneBox(Zone z, int x1, int x2) =>
+    color base = z.isAuto ? cNeut : cZone
+    // ruční zóny = pruh přes celý graf (jako obdélník protažený doprava); auto levely jen od začátku session
+    box bx = box.new(x1, z.top, x2, z.bot, border_color=color.new(base, z.isAuto ? T_AUTO_BRD : T_ZONE_BRD), border_width=W_LINE, border_style=ST_ZONE, extend=z.isAuto ? extend.none : extend.both, bgcolor=color.new(base, z.isAuto ? T_AUTO_BG : T_ZONE_BG), text="", text_size=SZ_ZTEXT, text_color=color.new(base, z.isAuto ? T_AUTO_TXT : T_ZONE_TXT), text_halign=text.align_right, text_valign=text.align_center)
+    bx
+
+// Auto zóna (PDH/PDL/ONH/ONL/OPEN) ± autoHalf; kresba až na poslední svíčce (jen blízko ceny)
+addAuto(array<Zone> arr, string nm, float px) =>
+    bool ok = not na(px)
+    if ok
+        Zone z = Zone.new(px + autoHalf, px - autoHalf, nm, true, na, 0, 0, -1000, 0)
+        z.x0 := bar_index
+        arr.push(z)
+    ok
+
+// Připraví retap: stejný směr v toleranci nahradí (zdroje sloučí; je-li v jednom zdroji DISP, platí invalidace
+// DISP (brk ∓ failTol), jeho level i start, jinak přísnější invalidace), max. MAX_RET (vyřadí se nejstarší bez DISP)
+armRetap(array<Retap> arr, int d, float lvl, float inv, string src) =>
+    string s2 = src
+    float  iv = inv
+    float  lv = lvl
+    int    st = bar_index
+    array<ZoneTap> taps = array.new<ZoneTap>()
+    bool   dI = str.contains(src, "DISP")   // výsledek nese displacement → platí invalidace DISP
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Retap o = arr.get(i)
+            if o.dir == d and math.abs(o.level - lvl) <= retapTol
+                if not na(o.taps)
+                    for tap in o.taps
+                        taps.push(tap)
+                bool oD = str.contains(o.src, "DISP")
+                s2 := str.contains(o.src, s2) ? o.src : str.contains(s2, o.src) ? s2 : s2 + " + " + o.src
+                if oD and not dI
+                    // invalidace (brk ∓ failTol), level a okno retapBars displacementu mají přednost před zónou
+                    iv := o.inval
+                    lv := o.level
+                    st := o.start
+                    dI := true
+                else if oD == dI
+                    iv := d == 1 ? math.max(iv, o.inval) : math.min(iv, o.inval)
+                // dI a ne oD: zůstává invalidace / level / start tohoto DISP
+                if not na(o.ln)
+                    o.ln.delete()
+                arr.remove(i)
+    line l = line.new(bar_index, lv, bar_index + 3, lv, color=rtCol(d, false), style=ST_RETAP, width=W_LINE)
+    arr.push(Retap.new(d, lv, iv, st, s2, l, taps))
+    if arr.size() > MAX_RET
+        // vyřadit nejstarší retap bez DISP (hlavní retap po displacementu nesmí vypadnout kvůli retapům zón)
+        int last = arr.size() - 1
+        int ix   = -1
+        for j = 0 to last - 1
+            if not str.contains(arr.get(j).src, "DISP")
+                ix := j
+                break
+        if ix < 0
+            ix := str.contains(arr.get(last).src, "DISP") ? 0 : last
+        Retap old = arr.remove(ix)
+        if not na(old.ln)
+            old.ln.delete()
+    s2
+
+// Ukončí range box: zesvětlí ho do historie (nebo smaže), smaže středovou čáru
+freezeRange(array<box> hist, box b, line m, int rx) =>
+    bool kept = false
+    if not na(m)
+        m.delete()
+    if not na(b)
+        b.set_right(rx)
+        if showRangeHist
+            b.set_border_color(color.new(cNeut, T_HIST_BRD))
+            b.set_bgcolor(color.new(cNeut, T_HIST_BG))
+            hist.push(b)
+            kept := true
+            if hist.size() > MAX_HIST
+                box.delete(hist.shift())
+        else
+            b.delete()
+    kept
+
+// FAIL této svíčky: stejný směr a level (v toleranci) = jedna značka, texty se sloučí
+addFail(array<float> lv, array<int> dr, array<string> tp, int d, float p, string t) =>
+    int idx = -1
+    if lv.size() > 0
+        for i = 0 to lv.size() - 1
+            if idx < 0 and dr.get(i) == d and math.abs(lv.get(i) - p) <= retapTol + syminfo.mintick * 0.5
+                idx := i
+    if idx >= 0
+        string o = tp.get(idx)
+        if not str.contains(o, t)
+            tp.set(idx, o + "\n" + t)
+    else
+        lv.push(p)
+        dr.push(d)
+        tp.push(t)
+    idx
+
+// Řádek mini panelu
+pRow(table t, int row, string k, string v, color vc, string tip) =>
+    table.cell(t, 0, row, k, text_color=color.new(cNeut, T_PANEL_KEY), text_halign=text.align_left, text_size=tsz)
+    table.cell(t, 1, row, v, text_color=vc, text_halign=text.align_left, text_size=tsz, tooltip=tip)
+
+// ═════════════════════════════ MĚŘENÍ (každý bar, globálně) ═════════════════════════════
+[mH, mL, mATR, mTick] = request.security(smtSym, timeframe.period, [high, low, ta.atr(atrLen), syminfo.mintick], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+max_bars_back(mH, 3000)
+max_bars_back(mL, 3000)
+max_bars_back(high, 3000)
+max_bars_back(low, 3000)
+bool  conf       = barstate.isconfirmed
+float atr        = ta.atr(atrLen)
+float atrF       = ta.atr(atrFastLen)
+float atrS       = ta.atr(atrSlowLen)
+float rng        = high - low
+float bodyS      = math.abs(close - open)
+float upW        = high - math.max(open, close)
+float loW        = math.min(open, close) - low
+float minWick    = math.max(wickMinPts, wickAtrMult * nz(atr))
+bool  bearShape0 = rng > 0 and upW >= wickPct * rng and upW >= minWick
+bool  bullShape0 = rng > 0 and loW >= wickPct * rng and loW >= minWick
+bool  bearShape  = bearShape0 and not bullShape0   // obě strany = nerozhodnost → nic
+bool  bullShape  = bullShape0 and not bearShape0
+float volAvg     = ta.sma(volume, volLen)
+float relVol     = volAvg > 0 ? volume / volAvg : na
+bool  hiVol      = not na(relVol) and relVol >= volMult
+bool  strong     = rng > 0 and not na(atr) and bodyS >= strongBodyPct * rng and rng >= strongAtr * atr
+float avgRange5  = ta.sma(rng, 5)
+float stopAtr    = atr > 0 ? stopPts / atr : na
+float atrRatio   = atrS > 0 ? atrF / atrS : na
+float atrN       = nz(atr, rng)                        // ATR (na začátku grafu rozsah svíčky)
+float eBufS      = slBufTicks * syminfo.mintick        // buffer za wick
+float thr        = math.max(pullAtr * atrN, pullMinPts) // práh potvrzení swingu
+float failTol    = math.max(retapTol, failAtr * atrN)   // FAIL displacementu až za touto vzdáleností
+float zoneNear   = 3 * math.max(stopPts, atrN * 3)      // zóny dál od close se jen přeskočí
+float runMin     = math.max(syminfo.mintick, 0.1 * atrN) // RUN = close za zónou aspoň o tolik
+
+// ═════════════════════════════ SESSION ═════════════════════════════
+bool inSess     = not na(time(timeframe.period, sessStr, TZ))
+bool inRth      = not na(time(timeframe.period, "0930-1600", TZ))
+bool inOn       = not na(time(timeframe.period, "1800-0930", TZ))   // Globex overnight 18:00–09:30 NY
+// nový obchodní den bez baru mimo session (graf jen RTH): pauza ≥ 55 min mezi KONCEM minulé a začátkem
+// této svíčky (nezávislé na TF) a zároveň nové NY datum (pauza / výpadek dat uvnitř dne session neresetuje)
+int  gapMs      = na(time_close[1]) ? 0 : time - time_close[1]
+int  dKey       = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+bool newDay     = na(time[1]) or dKey != dKey[1]
+bool dayBreak   = gapMs >= 55 * 60000 and newDay
+bool wasInSess  = inSess[1]
+bool wasInRth   = inRth[1]
+bool wasInOn    = inOn[1]
+bool newSess    = inSess and (not wasInSess or dayBreak)
+bool rthStart   = inRth and (not wasInRth or dayBreak)
+bool onStart    = inOn and not wasInOn                               // začátek overnightu (18:00 NY)
+int  todayStart = timestamp(TZ, year(last_bar_time, TZ), month(last_bar_time, TZ), dayofmonth(last_bar_time, TZ), 0, 0)
+bool isToday    = time >= todayStart     // kreslení boxů ručních zón – zóny vidět i před otevřením
+// vyhodnocení ručních zón: skutečný aktuální obchodní den (po 18:00 NY = další den), ne den posledního baru
+int  tdRef      = timenow + 6 * 3600000
+int  tradeDay0  = timestamp(TZ, year(tdRef, TZ), month(tdRef, TZ), dayofmonth(tdRef, TZ), 0, 0) - 6 * 3600000
+bool liveFeed   = timenow - last_bar_time < 4 * 86400000      // aktuální graf (i víkend); Bar Replay / stará data → den posledního baru
+bool zoneEvalOK = liveFeed ? time >= tradeDay0 : isToday
+bool evOK       = conf and inSess
+// ETH obchodní den (18:00 NY = začátek dalšího dne) pro TPO profil
+
+// ═════════════════════════════ STAV ═════════════════════════════
+var array<Zone>      zones     = array.new<Zone>()      // ruční + auto zóny
+var array<Zone>      spz       = array.new<Zone>()      // nevyplněné single prints
+var array<Retap>     retaps    = array.new<Retap>()
+var array<EntryDraw> entries   = array.new<EntryDraw>()
+var array<line>      deadLines = array.new<line>()
+var array<label>     evtLabels = array.new<label>()
+var array<line>      openLines = array.new<line>()
+var array<box>       rangeHist = array.new<box>()
+var array<SpDone>    spDone    = array.new<SpDone>()
+
+var box   curBox  = na     // aktuální range box
+var line  curMid  = na     // jeho slabý střed
+var float boxTop  = na     // hrany, které box právě ukazuje
+var float boxBot  = na
+var line  devHiLn = na     // rozvíjející se high v price discovery ↑
+var line  devLoLn = na     // rozvíjející se low v price discovery ↓
+var line  openLn  = na
+
+var int   sessStartBar = na
+var float sessOpen     = na
+var float orHi         = na
+var float orLo         = na
+var int   orHiBar      = na
+var int   orLoBar      = na
+
+var float rthHi    = na
+var float rthLo    = na
+var float pdh      = na
+var float pdl      = na
+var float onHi     = na
+var float onLo     = na
+var float onh      = na
+var float onl      = na
+var bool  onValid  = false   // overnight v akumulátoru onHi/onLo začal na skutečném začátku (18:00 NY)
+var bool  rthFull  = false   // RTH v akumulátoru rthHi/rthLo je kompletní
+var bool  sessFull = false   // aktuální session začala na svém skutečném začátku
+
+// Struktura – ATR-zigzag
+var bool  orDone   = false   // opening range uzavřen → struktura běží
+var int   zzDir    = 0       // 0 nerozhodnuto (start session), +1 sleduje up-leg, -1 down-leg
+var float legHi    = na      // extrémy aktuálního legu
+var float legLo    = na
+var int   legHiBar = na
+var int   legLoBar = na
+var float swH      = na      // poslední potvrzený swing high / low (na = žádný nebo prolomený)
+var float swL      = na
+var int   swHBar   = na
+var int   swLBar   = na
+var float brk      = na      // hrana prolomená posledním displacementem (= level retapu)
+var int   brkDir   = 0       // +1 nahoru, -1 dolů, 0 nic / po FAIL
+var int   brkBar   = na
+var float brkInval = na      // close za touto cenou = FAIL
+
+var int    lastDispDir   = 0
+var int    lastDispBar   = na
+var float  lastDispLevel = na
+var int    lastEntryDir  = 0
+var string lastEntryTyp  = ""
+var float  lastEntryPx   = na
+var int    lastEntryBar  = na
+var int    lastEntBarL   = na   // poslední NAKRESLENÉ entry long / short (odstup entryGap)
+var int    lastEntBarS   = na
+// poslední vystřelený retap na stranu (RESPECT na stejném levelu ho v retapBars znovu nepřipraví)
+var float  firedLvlL     = na
+var int    firedBarL     = na
+var float  firedLvlS     = na
+var int    firedBarS     = na
+
+// Single prints – běžící okno profilu (high / low jeho 1m svíček)
+var int          spWKey    = na    // klíč běžícího okna (floor(time / okno))
+var int          spWBar    = na    // první bar běžícího okna
+var array<float> spWH      = array.new<float>()
+var array<float> spWL      = array.new<float>()
+
+// k-tá zóna ze spojeného seznamu: nejdřív ruční + auto (nM kusů), pak single prints
+zAt(int k, int nM) =>
+    Zone z = na
+    if k < nM
+        z := zones.get(k)
+    else
+        z := spz.get(k - nM)
+    z
+
+// ───────── Zóny a single prints – kresby (jen blízko ceny, bez prodloužení doprava) ─────────
+// Smazat kresbu zóny (box / čáru)
+zErase(Zone z) =>
+    bool had = not na(z.bx) or not na(z.ln)
+    if not na(z.bx)
+        z.bx.delete()
+        z.bx := na
+    if not na(z.ln)
+        z.ln.delete()
+        z.ln := na
+    had
+
+// Ruční / auto zóna: box x1..x2 (vytvořit nebo posunout), styl podle stavu
+zDraw(Zone z, int x1, int x2) =>
+    if na(z.bx)
+        z.bx := zoneBox(z, x1, x2)
+    else
+        z.bx.set_lefttop(x1, z.top)
+        z.bx.set_rightbottom(x2, z.bot)
+    styleZone(z)
+    true
+
+// Nevyplněný single print x1..x2: 1 řádek = čára, víc řádků = box (po vyplnění části se typ může změnit)
+spDraw(Zone z, int x1, int x2) =>
+    bool one = z.top - z.bot < z.st * 0.5
+    if one
+        if not na(z.bx)
+            z.bx.delete()
+            z.bx := na
+        if na(z.ln)
+            z.ln := line.new(x1, z.top, x2, z.top, xloc=xloc.bar_index, color=color.new(cSP, T_SP_LINE), style=ST_SP, width=W_LINE)
+        else
+            z.ln.set_xy1(x1, z.top)
+            z.ln.set_xy2(x2, z.top)
+    else
+        if not na(z.ln)
+            z.ln.delete()
+            z.ln := na
+        if na(z.bx)
+            z.bx := box.new(x1, z.top, x2, z.bot, border_color=color.new(cSP, T_SP_BRD), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(cSP, T_SP_BG))
+        else
+            z.bx.set_lefttop(x1, z.top)
+            z.bx.set_rightbottom(x2, z.bot)
+    one
+
+// Vyplněná část: zesvětlená kresba končící na svíčce vyplnění (max. MAX_SPDONE);
+// začátek nejdřív zoneBack svíček před vyplněním (dlouhé kresby by roztahovaly cenovou osu)
+spFinish(float top, float bot, int x0, float st) =>
+    if spShow
+        int    x = math.max(nz(x0, bar_index), bar_index - zoneBack, 0)
+        SpDone d = SpDone.new(na, na)
+        if top - bot < st * 0.5
+            d.l := line.new(x, top, bar_index, top, xloc=xloc.bar_index, color=color.new(cSP, T_SPDONE), style=ST_SP, width=W_LINE)
+        else
+            d.b := box.new(x, top, bar_index, bot, border_color=color.new(cSP, T_SPDONE), border_width=W_LINE, border_style=ST_SP, bgcolor=color.new(cSP, T_SPDONE_BG))
+        spDone.push(d)
+        if spDone.size() > MAX_SPDONE
+            SpDone o = spDone.shift()
+            if not na(o.b)
+                o.b.delete()
+            if not na(o.l)
+                o.l.delete()
+    spShow
+
+// Odstranění single printu (hist = nechat zesvětlenou kresbu do historie)
+spRemove(Zone z, bool hist) =>
+    if hist
+        spFinish(z.top, z.bot, z.x0, z.st)
+    zErase(z)
+    hist
+
+// ───────── Kontext (čte stav výše) ─────────
+// Zbývající svíčky čekajícího retapu po displacementu (-1 = žádný)
+dispRetapRem() =>
+    int rem = -1
+    if brkDir != 0 and retaps.size() > 0
+        for rt in retaps
+            if rt.dir == brkDir and str.contains(rt.src, "DISP") and math.abs(rt.level - brk) <= retapTol
+                rem := math.max(retapBars - (bar_index - rt.start), 0)
+    rem
+
+// Platný range = oba swingy existují
+rangeValid() => orDone and not na(swH) and not na(swL) and swH > swL
+
+// Kontextová věta (stav struktury vůči ceně px)
+ctxLine(float px) =>
+    string s   = ""
+    int    rem = dispRetapRem()
+    bool   fW  = brkDir != 0 and not na(brkBar) and bar_index - brkBar <= retapBars
+    string rtS = rem >= 0 ? " → čekej retap " + fp(brk) + " (zbývá " + str.tostring(rem) + " sv.)" : ""
+    if not orDone
+        s := "Opening range – čekej na close " + str.tostring(orBars) + ". svíčky session"
+    else if rangeValid()
+        float  sz  = swH - swL
+        float  pos = (px - swL) / sz
+        float  loE = 0.5 - midPct / 200.0
+        float  hiE = 0.5 + midPct / 200.0
+        string wh  = pos > 1 ? "nad range → čekej close nad " + fp(swH) + " (displacement ↑)" : pos < 0 ? "pod range → čekej close pod " + fp(swL) + " (displacement ↓)" : pos >= loE and pos <= hiE ? "střed/chop → čekej displacement nad " + fp(swH) + " / pod " + fp(swL) : pos > hiE ? "u horní hrany → sleduj rejection / displacement nad " + fp(swH) : "u dolní hrany → sleduj rejection / displacement pod " + fp(swL)
+        s := "RANGE " + fp(swL) + "–" + fp(swH) + " (" + fd(sz) + " b. = " + fd(sz / stopPts) + "× stop) · cena " + str.tostring(math.round(pos * 100)) + " % = " + wh
+        if rem >= 0
+            s += "\nPo DISP " + (brkDir == 1 ? "↑ přes " : "↓ pod ") + fp(brk) + rtS + (fW ? " · FAIL při close " + (brkDir == 1 ? "pod " : "nad ") + fp(brkInval) : "")
+    else if na(swH) and not na(swL)
+        s := "PRICE DISCOVERY ↑" + (brkDir == 1 ? " – DISP přes " + fp(brk) : "") + rtS + "\nHigh " + fp(legHi) + " · nový swing high po pullbacku ≥ " + fd(thr) + " b." + (brkDir == 1 and fW ? " · FAIL při close pod " + fp(brkInval) : "")
+    else if na(swL) and not na(swH)
+        s := "PRICE DISCOVERY ↓" + (brkDir == -1 ? " – DISP pod " + fp(brk) : "") + rtS + "\nLow " + fp(legLo) + " · nový swing low po pullbacku ≥ " + fd(thr) + " b." + (brkDir == -1 and fW ? " · FAIL při close nad " + fp(brkInval) : "")
+    else
+        s := "Struktura se tvoří – čekej swing (pullback ≥ " + fd(thr) + " b.)" + rtS
+    s
+
+// Krátký kontext pro mini panel
+ctxShort(float px) =>
+    string s = "Opening range"
+    if rangeValid()
+        float sz  = swH - swL
+        float pos = (px - swL) / sz
+        float loE = 0.5 - midPct / 200.0
+        float hiE = 0.5 + midPct / 200.0
+        s := pos > 1 ? "RANGE · cena nad hranou" : pos < 0 ? "RANGE · cena pod hranou" : pos >= loE and pos <= hiE ? "RANGE · střed = chop" : pos > hiE ? "RANGE · u horní hrany" : "RANGE · u dolní hrany"
+    else if orDone and na(swH) and not na(swL)
+        int rem = dispRetapRem()
+        s := "DISCOVERY ↑ · " + (rem >= 0 ? "čekej retap " + fp(brk) : "high " + fp(legHi))
+    else if orDone and na(swL) and not na(swH)
+        int rem = dispRetapRem()
+        s := "DISCOVERY ↓ · " + (rem >= 0 ? "čekej retap " + fp(brk) : "low " + fp(legLo))
+    else if orDone
+        s := "Struktura se tvoří"
+    s
+
+// ───────── Ruční zóny – parsování (jednou) ─────────
+if barstate.isfirst
+    string zs = str.replace_all(zonesTxt, ",", ".")
+    zs := str.replace_all(zs, " ", "")
+    zs := str.replace_all(zs, "\n", ";")
+    zs := str.replace_all(zs, "–", "-")
+    zs := str.replace_all(zs, "—", "-")
+    array<string> parts = str.split(zs, ";")
+    int zn = 0
+    for p in parts
+        if p != "" and zn < MAX_ZONES
+            array<string> ab = str.split(p, "-")
+            float za = na
+            float zb = na
+            if ab.size() >= 2
+                za := str.tonumber(ab.get(0))
+                zb := str.tonumber(ab.get(1))
+            else
+                float zc = str.tonumber(p)
+                if not na(zc)
+                    za := zc + zoneHalf
+                    zb := zc - zoneHalf
+            if not na(za) and not na(zb)
+                zn += 1
+                zones.push(Zone.new(math.max(za, zb), math.min(za, zb), "Z" + str.tostring(zn), false, na, 0, 0, -1000, 0))
+
+// ───────── Denní levely (PDH/PDL, ONH/ONL) – jen uzavřené svíčky ─────────
+if conf
+    if rthStart
+        // neúplná RTH (graf začal uprostřed) / chybějící či neúplný overnight → na (auto zóny se vynechají)
+        pdh     := rthFull ? rthHi : na
+        pdl     := rthFull ? rthLo : na
+        onh     := onValid ? onHi : na
+        onl     := onValid ? onLo : na
+        onHi    := na
+        onLo    := na
+        onValid := false
+        rthHi   := high
+        rthLo   := low
+        rthFull := bar_index > 0 or str.format_time(time, "HHmm", TZ) == "0930"
+    else if inRth
+        rthHi := na(rthHi) ? high : math.max(rthHi, high)
+        rthLo := na(rthLo) ? low : math.min(rthLo, low)
+    else if inOn
+        if onStart   // začátek overnightu (18:00 NY) → nový akumulátor
+            onHi    := high
+            onLo    := low
+            onValid := bar_index > 0   // 1. svíčka grafu uprostřed overnightu = neúplný → neplatí
+        else
+            onHi := na(onHi) ? high : math.max(onHi, high)
+            onLo := na(onLo) ? low : math.min(onLo, low)
+    // svíčky 16:00–18:00 NY (post-close) se ignorují
+
+// ═════ SINGLE PRINTS – profil každého okna (výchozí 30 min) z vlastních 1m svíček ═════
+// Stejně jako Single Prints [Sim] (Profile aggregation 30, Build from 1): okno :00–:30 / :30–:00 = samostatný
+// profil, TPO = 1m svíčka. Na konci okna (první svíčka dalšího okna): počet svíček přes každý řádek (krok spStep);
+// single = řádek s právě 1 svíčkou mezi nejnižším a nejvyšším řádkem s ≥ 2 svíčkami (okraje okna ne, bez volby
+// tailů). Souvislé single řádky = jeden SP (zóna). Řádky, na kterých obchoduje už tato svíčka, se vynechají
+// (byly by hned vyplněné). Vyplňování po řádcích = Krok 4b (každá svíčka, platí přes dny).
+int spWk = math.floor(time / (spWin * 60000.0))
+if conf and useSP
+    if not na(spWKey) and spWk != spWKey and spWH.size() > 0
+        float st  = spStep
+        float wLo = spWL.min()
+        float wHi = spWH.max()
+        int   R0  = math.ceil(wLo / st - 1e-6)
+        int   nR  = math.floor(wHi / st + 1e-6) - R0 + 1
+        if nR >= 3 and nR <= SP_MAXROWS
+            array<int> cw = array.new<int>(nR + 1, 0)
+            for b = 0 to spWH.size() - 1
+                int a1 = math.max(math.ceil(spWL.get(b) / st - 1e-6) - R0, 0)
+                int b1 = math.min(math.floor(spWH.get(b) / st + 1e-6) - R0, nR - 1)
+                if a1 <= b1
+                    cw.set(a1, cw.get(a1) + 1)
+                    cw.set(b1 + 1, cw.get(b1 + 1) - 1)
+            int acc = 0
+            int mLo = -1
+            int mHi = -1
+            for j = 0 to nR - 1
+                acc += cw.get(j)
+                cw.set(j, acc)
+                if acc >= 2
+                    if mLo < 0
+                        mLo := j
+                    mHi := j
+            int r0 = spTails ? 0 : mLo + 1
+            int r1 = spTails ? nR - 1 : mHi - 1
+            if (spTails or mLo >= 0) and r1 >= r0
+                int exLo = math.ceil(low / st - 1e-6) - R0
+                int exHi = math.floor(high / st + 1e-6) - R0
+                int rs   = -1
+                for i = r0 to r1 + 1
+                    bool one = i <= r1 and cw.get(i) == 1 and (i < exLo or i > exHi)
+                    if one and rs < 0
+                        rs := i
+                    else if not one and rs >= 0
+                        if i - rs >= spMinRows
+                            float zBot = (R0 + rs) * st
+                            float zTop = (R0 + i - 1) * st
+                            spz.push(Zone.new(zTop, zBot, "SP", false, na, 0, 0, -1000, 0, true, true, st, spWBar, bar_index, na))
+                        rs := -1
+        spWH.clear()
+        spWL.clear()
+    if na(spWKey) or spWk != spWKey
+        spWKey := spWk
+        spWBar := bar_index
+    spWH.push(high)
+    spWL.push(low)
+
+// ═════ KROK 1 – nová session: reset ═════
+if evOK and newSess
+    sessStartBar := bar_index
+    sessOpen     := open
+    orHi         := high
+    orLo         := low
+    orHiBar      := bar_index
+    orLoBar      := bar_index
+    // session začínající na 1. svíčce grafu uprostřed dne = neúplná → bez OPEN zóny a čáry Open
+    sessFull     := bar_index > 0 or str.format_time(time, "HHmm", TZ) == str.substring(sessStr, 0, 4)
+    // čára Open minulé session: ukončit (graf jen RTH → blok konce session se nespustí)
+    if not na(openLn)
+        openLn.set_x2(math.min(openLn.get_x2(), bar_index - 1))
+        openLn := na
+    firedLvlL := na
+    firedBarL := na
+    firedLvlS := na
+    firedBarS := na
+    // odstup entryGap neplatí přes hranici session (graf jen RTH: 15:59 a 9:30 jsou sousední svíčky)
+    lastEntBarL := na
+    lastEntBarS := na
+    // range minulé session ukončit (graf jen RTH nemá svíčku mimo session)
+    freezeRange(rangeHist, curBox, curMid, bar_index - 1)
+    curBox := na
+    curMid := na
+    boxTop := na
+    boxBot := na
+    if not na(devHiLn)
+        devHiLn.delete()
+        devHiLn := na
+    if not na(devLoLn)
+        devLoLn.delete()
+        devLoLn := na
+    // retapy smazat
+    for rt in retaps
+        if not na(rt.ln)
+            rt.ln.delete()
+    retaps.clear()
+    // auto zóny smazat, ruční resetovat
+    if zones.size() > 0
+        for i = zones.size() - 1 to 0
+            Zone z = zones.get(i)
+            if z.isAuto
+                if not na(z.bx)
+                    z.bx.delete()
+                zones.remove(i)
+            else
+                z.lastOut := 0
+                z.prevS   := 0
+                z.state   := 0
+                z.lastTapL := na
+                z.lastTapS := na
+                z.lastEvt := -1000
+                z.fresh   := true
+                styleZone(z)
+    for z in spz
+        z.lastOut := 0
+        z.prevS   := 0
+        z.state   := 0
+        z.lastTapL := na
+        z.lastTapS := na
+        z.lastEvt := -1000
+        z.fresh   := true
+    // auto zóny znovu (mimo RTH = poslední dokončená RTH je ještě v akumulátoru)
+    if useAuto
+        addAuto(zones, "PDH", inRth ? pdh : (rthFull ? rthHi : na))
+        addAuto(zones, "PDL", inRth ? pdl : (rthFull ? rthLo : na))
+        addAuto(zones, "ONH", inRth ? onh : (onValid ? onHi : na))
+        addAuto(zones, "ONL", inRth ? onl : (onValid ? onLo : na))
+        if sessFull
+            addAuto(zones, "OPEN", sessOpen)
+    // struktura od nuly (opening range se uzavře v Kroku 3)
+    orDone        := false
+    zzDir         := 0
+    legHi         := high
+    legLo         := low
+    legHiBar      := bar_index
+    legLoBar      := bar_index
+    swH           := na
+    swL           := na
+    swHBar        := na
+    swLBar        := na
+    brk           := na
+    brkDir        := 0
+    brkBar        := na
+    brkInval      := na
+    lastDispDir   := 0
+    lastDispBar   := na
+    lastDispLevel := na
+    // čára Open (bez popisku)
+    if showOpenLine and sessFull
+        openLn := line.new(bar_index, sessOpen, bar_index + 2, sessOpen, color=color.new(cNeut, T_OPEN), style=ST_OPEN, width=W_LINE)
+        openLines.push(openLn)
+        if openLines.size() > MAX_OPEN
+            line.delete(openLines.shift())
+
+// SMT drží vlastní snapshoty: swH/swL se při displacementu v původní logice mažou.
+var SmtSwing smtH = na
+var SmtSwing smtL = na
+var array<line> smtLines = array.new<line>()
+var array<label> smtMid    = array.new<label>()   // nápis SMT uprostřed čáry
+var array<label> smtLabels = array.new<label>()
+var int smtBullBar = na
+var int smtBearBar = na
+var int smtBullPrev = na
+var int smtBearPrev = na
+var int lastSmtDir = 0
+var int lastSmtBar = na
+
+// d=-1 high/bearish; d=1 low/bullish. Offset vždy 0..SMT_HISTORY-1.
+smtExtreme(float a, float b, int d) => na(a) ? b : d == -1 ? math.max(a, b) : math.min(a, b)
+smtBeyond(float a, float b, int d) => not na(a) and not na(b) and (d == -1 ? a > b : a < b)
+
+smtNew(SmtSwing previous, float p, int b, int d, bool enabled) =>
+    SmtSwing q = previous
+    if enabled
+        q := SmtSwing.new(p, b)
+        int age = bar_index - b
+        if age < 0 or age + smtWin >= SMT_HISTORY or b < smtWin
+            q.valid := false
+        else
+            if age > 0
+                for off = 0 to age - 1
+                    float v = d == -1 ? mH[off] : mL[off]
+                    if na(v)
+                        q.valid := false
+                    q.since := smtExtreme(q.since, v, d)
+                    q.chartSince := smtExtreme(q.chartSince, d == -1 ? high[off] : low[off], d)
+            q.chartSeen := smtBeyond(q.chartSince, p, d)
+    q
+smtStep(SmtSwing q, int d, bool enabled) =>
+    bool event = false
+    if enabled and not na(q) and q.valid and not q.fired
+        int age = bar_index - q.bar
+        if age >= SMT_HISTORY - smtWin
+            q.valid := false
+        else
+            bool justReady = not q.ready and age >= smtWin
+            if justReady
+                // Okno ± smtWin je teď celé v minulosti nebo na uzavřené aktuální svíčce.
+                for off = age - smtWin to age + smtWin
+                    float v = d == -1 ? mH[off] : mL[off]
+                    if na(v)
+                        q.valid := false
+                    q.other := smtExtreme(q.other, v, d)
+                q.ready := true
+                // Předchozí průraz druhého trhu nesmí vytvořit opožděný signál.
+                q.otherSeen := smtBeyond(q.since, q.other, d)
+            float vNow = d == -1 ? mH : mL
+            if na(vNow)
+                q.valid := false
+            if age > 0
+                q.since := smtExtreme(q.since, vNow, d)
+                q.chartSince := smtExtreme(q.chartSince, d == -1 ? high : low, d)
+            float chartMin = math.max(2 * syminfo.mintick, smtMin * atr)
+            float otherMin = math.max(2 * mTick, smtMin * mATR)
+            bool filterReady = not na(atr) and not na(mATR) and not na(mTick) and mTick > 0
+            bool chartBreak = smtBeyond(q.chartSince, q.price, d) and (q.chartSince - q.price) * -d >= chartMin
+            bool otherBreak = q.ready and smtBeyond(q.since, q.other, d) and (q.since - q.other) * -d >= otherMin
+            bool otherHeld = q.ready and not na(q.since) and (q.other - q.since) * -d >= mTick
+            bool chartHeld = not na(q.chartSince) and (q.price - q.chartSince) * -d >= syminfo.mintick
+            event := q.valid and q.ready and filterReady and ((chartBreak and not q.chartSeen and otherHeld) or (otherBreak and not q.otherSeen and chartHeld))
+            // Lepivé příznaky: změna ATR nesmí znovu povolit tentýž průraz.
+            q.chartSeen := q.chartSeen or chartBreak
+            if q.ready
+                q.otherSeen := q.otherSeen or otherBreak
+            if event
+                q.fired := true
+    event
+
+// ───────── Sběrné proměnné této svíčky ─────────
+array<Cand>   cands    = array.new<Cand>()
+array<float>  failLv   = array.new<float>()    // FAIL: level
+array<int>    failDr   = array.new<int>()      // FAIL: směr selhaného setupu (+1 long, -1 short)
+array<string> failTp   = array.new<string>()   // FAIL: tooltip
+string tipUpA   = ""      // šipka ↑ (DISP / RUN zóny) – tooltip
+string tipDnA   = ""
+string txtUpA   = ""      // interní typ události (graf vykreslí jen glyf)
+string txtDnA   = ""
+string tipUpR   = ""      // kosočtverec RESPECT ↑
+string tipDnR   = ""
+string txtUpR   = ""
+string txtDnR   = ""
+float  respUpPx = na
+float  respDnPx = na
+bool   dispUpEv = false   // šipka patří displacementu (barva bull / bear)
+bool   dispDnEv = false
+// barva značky RUN / RESPECT podle druhu zóny; pořadí (rank): 0 nic, 1 single print, 2 auto level, 3 ruční zóna
+int    runUpR   = 0
+int    runDnR   = 0
+int    respUpR  = 0
+int    respDnR  = 0
+color  runUpC   = na
+color  runDnC   = na
+color  respUpC  = na
+color  respDnC  = na
+bool   edgeBear = false   // bear rejection u hrany (swing high, nový high v discovery, respect zóny)
+bool   edgeBull = false
+string alertMsg = ""
+bool smtNewHigh = false
+bool smtNewLow = false
+
+if conf and newSess
+    smtH := na
+    smtL := na
+bool smtBear = smtStep(smtH, -1, evOK and smtOn)
+bool smtBull = smtStep(smtL, 1, evOK and smtOn)
+bool smtConflict = smtBear and smtBull
+if evOK and smtOn and not smtConflict
+    for d = -1 to 1 by 2
+        bool event = d == -1 ? smtBear : smtBull
+        if event
+            SmtSwing q = d == -1 ? smtH : smtL
+            float px = d == -1 ? high : low
+            bool chartBreak = smtBeyond(q.chartSince, q.price, d)
+            string side = d == -1 ? "high" : "low"
+            string cmpChart = chartBreak ? (d == -1 ? " > " : " < ") : (d == -1 ? " ≤ " : " ≥ ")
+            string cmpOther = chartBreak ? (d == -1 ? " ≤ " : " ≥ ") : (d == -1 ? " > " : " < ")
+            string tipSmt = "SMT " + (d == -1 ? "↓ (bearish): " : "↑ (bullish): ") + syminfo.ticker + " " + side + " " + fp(q.chartSince) + cmpChart + "swing " + fp(q.price) + " (" + fR(q.chartSince - q.price) + " b.) · " + smtSym + " " + side + " " + fd(q.since) + cmpOther + "swing " + fd(q.other) + " (" + fR(q.since - q.other) + " b.)"
+            color base = d == -1 ? cBear : cBull
+            smtLines.push(line.new(q.bar, q.price, bar_index, px, color=color.new(base, T_SMT_LINE), style=ST_SMT, width=W_LINE))
+            smtLabels.push(glyph(px, GL_SMT, "", 0, color.new(base, T_SMT), tipSmt))
+            // malý nápis SMT uprostřed čáry (bearish nad čárou, bullish pod ní)
+            int   smX = math.round((q.bar + bar_index) / 2.0)
+            float smY = (q.price + px) / 2.0 + (d == -1 ? SMT_TXT_OFF : -SMT_TXT_OFF) * nz(atrN, 1.0)
+            smtMid.push(label.new(smX, smY, SMT_TXT, xloc=xloc.bar_index, yloc=yloc.price, color=color.new(base, T_INVIS), style=label.style_none, textcolor=color.new(base, T_SMT), size=SZ_MARK, tooltip=tipSmt))
+            if smtLines.size() > MAX_SMT
+                line.delete(smtLines.shift())
+                label.delete(smtLabels.shift())
+            if smtMid.size() > MAX_SMT
+                label.delete(smtMid.shift())
+            if d == 1
+                smtBullPrev := smtBullBar
+                smtBullBar := bar_index
+            else
+                smtBearPrev := smtBearBar
+                smtBearBar := bar_index
+            lastSmtDir := d
+            lastSmtBar := bar_index
+            if alSMT
+                alertMsg := am(alertMsg, tipSmt)
+
+// ═════ KROK 2 – retap engine (jen retapy ze starších svíček) ═════
+if evOK and retaps.size() > 0
+    for i = retaps.size() - 1 to 0
+        Retap rt = retaps.get(i)
+        if bar_index > rt.start
+            bool isL    = rt.dir == 1
+            bool touch  = isL ? low <= rt.level + retapTol : high >= rt.level - retapTol
+            bool failed = isL ? close < rt.inval : close > rt.inval
+            bool held   = isL ? close >= rt.level : close <= rt.level
+            // retap z displacementu (i sloučený) = jen dotek a close na správné straně;
+            // retap jen ze zóny (RUN / RESPECT): rejection podle zoneRetapRej
+            bool isD    = str.contains(rt.src, "DISP")
+            bool rejOK  = isD or not zoneRetapRej or (isL ? bullShape : bearShape)
+            // RUN metadata přežije sloučení s DISP; první dotek se vyhodnocuje na hraně dané zóny.
+            if not failed and bar_index - rt.start < retapBars and not na(rt.taps)
+                for tap in rt.taps
+                    bool tapFail = isL ? close < tap.inval : close > tap.inval
+                    bool tapTouch = isL ? low <= tap.level + retapTol : high >= tap.level - retapTol
+                    if not tap.touched and not tapFail and bar_index > tap.start and bar_index - tap.start < retapBars and tapTouch
+                        tap.touched := true
+                        bool tapHeld = isL ? close >= tap.level : close <= tap.level
+                        string tapTip = "RETAP do zóny " + tap.rangeText + " po RUN " + (isL ? "↑" : "↓") + " (před " + str.tostring(bar_index - tap.start) + " sv.) · close " + fp(close) + (tapHeld ? " drží" : " zpět v zóně") + " · není entry"
+                        int lastTap = isL ? tap.zoneRef.lastTapL : tap.zoneRef.lastTapS
+                        bool tapCool = na(lastTap) or bar_index - lastTap > zoneCool
+                        // Dotek se spotřebuje i během klidu; později se opožděné ◇ nedokreslí.
+                        if tapCool
+                            if isL
+                                tap.zoneRef.lastTapL := bar_index
+                            else
+                                tap.zoneRef.lastTapS := bar_index
+                            pushLabel(evtLabels, glyph(tap.level, GL_ZRETAP, "", 0, color.new(tap.base, T_ZRETAP), tapTip), MAX_EVT)
+                            if alZoneRetap
+                                alertMsg := am(alertMsg, tapTip)
+                    if tapFail or bar_index - tap.start >= retapBars
+                        tap.touched := true
+            if failed
+                if isD
+                    // FAIL displacementu: značka × (čára retapu zůstane slabě v historii)
+                    addFail(failLv, failDr, failTp, rt.dir, rt.level, "FAIL – cena zpět " + (isL ? "pod " : "nad ") + fp(rt.level) + " (failed displacement)")
+                    if not na(rt.ln)
+                        rt.ln.set_x2(bar_index)
+                        rt.ln.set_color(rtCol(rt.dir, true))
+                        pushDead(deadLines, rt.ln)
+                else
+                    // retap zóny selhal (close za druhou hranou zóny): TIŠE – bez značky, čára zmizí
+                    if alFail
+                        alertMsg := am(alertMsg, "Retap " + (isL ? "LONG @" : "SHORT @") + fp(rt.level) + " zrušen – close " + (isL ? "pod " : "nad ") + fp(rt.inval) + " (" + rt.src + ")")
+                    if not na(rt.ln)
+                        rt.ln.delete()
+                retaps.remove(i)
+            else if touch and held and rejOK
+                // retap držel → kandidát na entry. DISP: fill = cena, kterou by limitka reálně dostala
+                // (level, když se na něm obchodovalo, jinak hrana tolerance; nikdy lepší než open svíčky).
+                // Zóna: entry na close, rejection podle zoneRetapRej
+                bool  hit    = isL ? low <= rt.level : high >= rt.level
+                float fillPx = not isD ? close : isL ? math.min(open, hit ? rt.level : rt.level + retapTol) : math.max(open, hit ? rt.level : rt.level - retapTol)
+                cands.push(Cand.new(rt.dir, "RETAP", 4, fillPx, isL ? math.min(low, rt.inval) : math.max(high, rt.inval), isD ? rt.src : rt.src + (zoneRetapRej ? " · rejection svíčka, entry na close" : " · dotek a držení, entry na close")))
+                if isL
+                    firedLvlL := rt.level
+                    firedBarL := bar_index
+                else
+                    firedLvlS := rt.level
+                    firedBarS := bar_index
+                if not na(rt.ln)
+                    rt.ln.set_x2(bar_index)
+                    rt.ln.set_color(rtCol(rt.dir, true))
+                    pushDead(deadLines, rt.ln)
+                retaps.remove(i)
+            else if bar_index - rt.start >= retapBars
+                // vypršel → čára zmizí
+                if not na(rt.ln)
+                    rt.ln.delete()
+                retaps.remove(i)
+            else
+                if not na(rt.ln)
+                    rt.ln.set_x2(bar_index + 3)
+
+// ═════ KROK 3 – struktura: ATR-zigzag (range = poslední swing low → poslední swing high) ═════
+if evOK and not na(sessStartBar)
+    int nIn = bar_index - sessStartBar + 1
+    if not orDone
+        // opening range: high/low prvních orBars svíček session → první range
+        if nIn > 1
+            if high > orHi
+                orHi    := high
+                orHiBar := bar_index
+            if low < orLo
+                orLo    := low
+                orLoBar := bar_index
+        if nIn >= orBars
+            orDone   := true
+            smtNewHigh := true
+            smtNewLow := true
+            swH      := orHi
+            swHBar   := orHiBar
+            swL      := orLo
+            swLBar   := orLoBar
+            legHi    := orHi
+            legHiBar := orHiBar
+            legLo    := orLo
+            legLoBar := orLoBar
+            zzDir    := 0
+    else
+        // hrany a displacement PŘED touto svíčkou
+        float h0  = swH
+        float l0  = swL
+        int   bd0 = brkDir
+        float bk0 = brk
+        float bv0 = brkInval
+        int   bb0 = brkBar
+        bool  okS = not requireStrong or strong
+        // 1) DISPLACEMENT: 1m close za swing high / low
+        if not na(h0) and close > h0 and okS
+            brk           := h0
+            brkDir        := 1
+            brkBar        := bar_index
+            brkInval      := h0 - failTol
+            swH           := na          // horní hrana prolomená → price discovery ↑
+            lastDispDir   := 1
+            lastDispBar   := bar_index
+            lastDispLevel := h0
+            dispUpEv      := true
+            string sU = armRetap(retaps, 1, h0, h0 - failTol, "DISP")
+            float  dS = close - (low - eBufS)
+            if dS <= stopPts
+                cands.push(Cand.new(1, "DISP", 1, close, low, "DISP"))
+            tipUpA := jn(tipUpA, "DISP ↑ přes swing high " + fp(h0) + (strong ? " · silná svíčka" : "") + (na(l0) ? "" : "\nrange " + fp(l0) + "–" + fp(h0) + " (" + fd(h0 - l0) + " b.)") + " → čekej retap " + fp(h0) + (dS <= stopPts ? "" : "\nstop za low svíčky " + fd(dS) + " b. > stop → entry až na retapu"))
+            txtUpA := "DISP"
+            if alDisp
+                alertMsg := am(alertMsg, "DISP ↑ přes " + fp(h0) + (na(l0) ? "" : " (range " + fp(l0) + "–" + fp(h0) + ")"))
+            if alRetapArm
+                alertMsg := am(alertMsg, "Retap LONG @" + fp(h0) + " (" + sU + ")")
+        else if not na(l0) and close < l0 and okS
+            brk           := l0
+            brkDir        := -1
+            brkBar        := bar_index
+            brkInval      := l0 + failTol
+            swL           := na          // dolní hrana prolomená → price discovery ↓
+            lastDispDir   := -1
+            lastDispBar   := bar_index
+            lastDispLevel := l0
+            dispDnEv      := true
+            string sD = armRetap(retaps, -1, l0, l0 + failTol, "DISP")
+            float  dS = (high + eBufS) - close
+            if dS <= stopPts
+                cands.push(Cand.new(-1, "DISP", 1, close, high, "DISP"))
+            tipDnA := jn(tipDnA, "DISP ↓ pod swing low " + fp(l0) + (strong ? " · silná svíčka" : "") + (na(h0) ? "" : "\nrange " + fp(l0) + "–" + fp(h0) + " (" + fd(h0 - l0) + " b.)") + " → čekej retap " + fp(l0) + (dS <= stopPts ? "" : "\nstop za high svíčky " + fd(dS) + " b. > stop → entry až na retapu"))
+            txtDnA := "DISP"
+            if alDisp
+                alertMsg := am(alertMsg, "DISP ↓ pod " + fp(l0) + (na(h0) ? "" : " (range " + fp(l0) + "–" + fp(h0) + ")"))
+            if alRetapArm
+                alertMsg := am(alertMsg, "Retap SHORT @" + fp(l0) + " (" + sD + ")")
+        // rejection u hrany: wick vybral swing high / low a svíčka uzavřela zpět (bez close za hranou)
+        if not na(h0) and bearShape and high > h0 and close <= h0
+            edgeBear := true
+            if wickEntries and (high + eBufS) - close <= stopPts
+                cands.push(Cand.new(-1, "PROTI WICKU", 3, close, high, "swing high " + fp(h0)))
+        if not na(l0) and bullShape and low < l0 and close >= l0
+            edgeBull := true
+            if wickEntries and close - (low - eBufS) <= stopPts
+                cands.push(Cand.new(1, "PROTI WICKU", 3, close, low, "swing low " + fp(l0)))
+        // rejection na novém extrému v price discovery (jen výrazná tečka)
+        if na(h0) and zzDir >= 0 and bearShape and high >= legHi
+            edgeBear := true
+        if na(l0) and zzDir <= 0 and bullShape and low <= legLo
+            edgeBull := true
+        // 2) FAIL: close zpět za prolomenou hranou o víc než failTol (do retapBars svíček od DISP)
+        if bd0 == 1 and not na(bb0) and bar_index - bb0 <= retapBars and close < bv0
+            float fTop = math.max(legHi, high)
+            swHBar := high > legHi ? bar_index : legHiBar
+            swH    := fTop                 // failed high = nová horní hrana
+            if brkBar == bb0
+                brkDir := 0
+            if retaps.size() > 0
+                for i = retaps.size() - 1 to 0
+                    Retap o = retaps.get(i)
+                    if o.dir == 1 and str.contains(o.src, "DISP") and math.abs(o.level - bk0) <= retapTol
+                        if not na(o.ln)
+                            o.ln.set_x2(bar_index)
+                            o.ln.set_color(rtCol(1, true))
+                            pushDead(deadLines, o.ln)
+                        retaps.remove(i)
+            addFail(failLv, failDr, failTp, 1, bk0, "FAIL – cena zpět pod " + fp(bk0) + " (failed displacement)")
+            addFail(failLv, failDr, failTp, 1, bk0, "→ failed high " + fp(fTop) + " = horní hrana range")
+        else if bd0 == -1 and not na(bb0) and bar_index - bb0 <= retapBars and close > bv0
+            float fBot = math.min(legLo, low)
+            swLBar := low < legLo ? bar_index : legLoBar
+            swL    := fBot                 // failed low = nová dolní hrana
+            if brkBar == bb0
+                brkDir := 0
+            if retaps.size() > 0
+                for i = retaps.size() - 1 to 0
+                    Retap o = retaps.get(i)
+                    if o.dir == -1 and str.contains(o.src, "DISP") and math.abs(o.level - bk0) <= retapTol
+                        if not na(o.ln)
+                            o.ln.set_x2(bar_index)
+                            o.ln.set_color(rtCol(-1, true))
+                            pushDead(deadLines, o.ln)
+                        retaps.remove(i)
+            addFail(failLv, failDr, failTp, -1, bk0, "FAIL – cena zpět nad " + fp(bk0) + " (failed displacement)")
+            addFail(failLv, failDr, failTp, -1, bk0, "→ failed low " + fp(fBot) + " = dolní hrana range")
+    // 3) ZIGZAG: swing se potvrdí pullbackem ≥ thr (i na svíčce, která uzavřela opening range)
+    if orDone
+        if zzDir >= 0 and high > legHi
+            legHi    := high
+            legHiBar := bar_index
+        if zzDir <= 0 and low < legLo
+            legLo    := low
+            legLoBar := bar_index
+        // na svíčce, která extrém udělala, je jistý jen pohyb od extrému ke close
+        bool  nH   = legHiBar == bar_index
+        bool  nL   = legLoBar == bar_index
+        float pbDn = legHi - (nH ? close : low)
+        float pbUp = (nL ? close : high) - legLo
+        bool  hitH = zzDir >= 0 and pbDn >= thr
+        bool  hitL = zzDir <= 0 and pbUp >= thr
+        if hitH and hitL
+            // nerozhodnuto (start session): dřívější extrém = swing, na stejné svíčce podle barvy svíčky
+            bool hiFirst = legHiBar < legLoBar or (legHiBar == legLoBar and close < open)
+            hitH := hiFirst
+            hitL := not hiFirst
+        if hitH
+            smtNewHigh := true
+            swH    := legHi
+            swHBar := legHiBar
+            zzDir  := -1
+            if not (legLoBar > legHiBar)
+                legLo    := low
+                legLoBar := bar_index
+        else if hitL
+            smtNewLow := true
+            swL    := legLo
+            swLBar := legLoBar
+            zzDir  := 1
+            if not (legHiBar > legLoBar)
+                legHi    := high
+                legHiBar := bar_index
+
+// Nový snapshot až po detekci: právě potvrzený swing nenahradí dosavadní před jeho sweep testem.
+smtH := smtNew(smtH, swH, swHBar, -1, evOK and smtOn and smtNewHigh)
+smtL := smtNew(smtL, swL, swLBar, 1, evOK and smtOn and smtNewLow)
+
+// ═════ KROK 4 – zóny + single prints: respect / run-through (strukturu nemění) ═════
+// RESPECT jen rejection svíčkou ve směru respektu; RUN jen close za druhou hranou o ≥ runMin.
+// Zóny dál než zoneNear od close se jen přeskočí (strana close se zapíše, test začne ze správné strany).
+int nZm   = zones.size()
+int nZall = nZm + spz.size()
+if evOK and nZall > 0
+    for k = 0 to nZall - 1
+        Zone z = zAt(k, nZm)
+        bool live = z.isAuto or z.isSP or not zonesTodayOnly or zoneEvalOK
+        if live
+            int   s  = close > z.top ? 1 : close < z.bot ? -1 : 0
+            float dz = s == 1 ? close - z.top : s == -1 ? z.bot - close : 0.0
+            if dz > zoneNear
+                z.lastOut := s
+                z.prevS   := s
+                z.fresh   := true
+            else
+                bool touched = high >= z.bot and low <= z.top
+                int  evt     = 0
+                // klid zóny: zoneCool svíček po RESPECT / RUN žádná další událost téže zóny
+                // (lastOut / prevS se sledují dál → po klidu test začne ze správné strany)
+                bool coolOK  = bar_index - z.lastEvt > zoneCool
+                // OPEN (úzká auto zóna): RUN jen silnou svíčkou
+                bool isOpenZ = z.isAuto and z.name == "OPEN"
+                bool deep    = s == 1 ? close - z.top >= runMin : s == -1 ? z.bot - close >= runMin : false
+                bool rejOK   = s == 1 ? bullShape : s == -1 ? bearShape : false
+                bool respCnd = s != 0 and s == z.lastOut and (touched or z.prevS == 0) and rejOK
+                bool shallow = false   // close jen kousek za druhou hranou → strana se nemění
+                if s != 0 and z.lastOut != 0
+                    if s == -z.lastOut
+                        if deep
+                            // run-through: close skrz celou zónu (jen mimo klid zóny – chop přes zónu nic nedělá)
+                            bool runOK = isOpenZ ? strong : (not requireStrong or strong)
+                            if coolOK and runOK
+                                evt := 2 * s
+                        else
+                            shallow := true
+                    else if respCnd and coolOK and z.fresh
+                        evt := s       // respect: test a close zpět na stejnou stranu rejection svíčkou (jen nový test zóny)
+                if evt != 0
+                    int    zd   = evt > 0 ? 1 : -1
+                    bool   zRun = evt == 2 or evt == -2
+                    float  zLvl = zd == 1 ? z.top : z.bot
+                    float  zInv = zd == 1 ? z.bot : z.top
+                    string zTyp = zRun ? "RUN " : "RESPECT "
+                    string zTxt = zTyp + (zd == 1 ? "↑ " : "↓ ") + "zóna " + zRange(z)
+                    // RESPECT na levelu, kde retap už vystřelil (méně než retapBars zpět) → retap znovu nepřipravovat
+                    float  fL   = zd == 1 ? firedLvlL : firedLvlS
+                    int    fB   = zd == 1 ? firedBarL : firedBarS
+                    bool   dup  = not zRun and not na(fL) and math.abs(fL - zLvl) <= retapTol and bar_index - fB < retapBars
+                    string zSrc = ""
+                    if not dup
+                        zSrc := armRetap(retaps, zd, zLvl, zInv, zTyp + "zóna " + zRange(z))
+                    // vzdálenost stopu za wick / svíčku (entry jen když se vejde do stopu)
+                    float  zStp = zd == 1 ? close - (low - eBufS) : (high + eBufS) - close
+                    bool   zFit = zStp <= stopPts
+                    string zTip = zRun ? "RUN " + (zd == 1 ? "↑" : "↓") + " přes zónu " + zRange(z) + " · close " + fp(close) + " (" + (zd == 1 ? "+" : "−") + fd(math.abs(close - zLvl)) + " b. " + (zd == 1 ? "nad" : "pod") + " zónou) → čekej retap " + fp(zLvl) : zTxt + (dup ? "" : " → čekej retap " + fp(zLvl))
+                    // barva značky podle druhu zóny (ruční > auto level > single print; ve stejném druhu první)
+                    int    zRk  = z.isSP ? 1 : z.isAuto ? 2 : 3
+                    color  zC   = z.isSP ? cSP : z.isAuto ? cNeut : cZone
+                    if zRun
+                        // Připojit RUN k právě připravenému retapu (i při sloučení do DISP).
+                        for pending in retaps
+                            if pending.dir == zd and math.abs(pending.level - zLvl) <= retapTol
+                                if pending.taps.size() > 0
+                                    for ti = pending.taps.size() - 1 to 0
+                                        if pending.taps.get(ti).rangeText == zRange(z)
+                                            pending.taps.remove(ti)
+                                pending.taps.push(ZoneTap.new(zLvl, zInv, bar_index, zRange(z), zC, false, z))
+                                break
+                        // run-through = displacement skrz zónu (šipka; entry jen při zoneRunEntries)
+                        // single print: RUN vyplní jen řádky, kterými svíčka prošla (Krok 4b)
+                        if zd == 1
+                            tipUpA := jn(tipUpA, zTip)
+                            txtUpA := txtUpA == "" ? "RUN " + z.name : txtUpA
+                            if zRk > runUpR
+                                runUpR := zRk
+                                runUpC := zC
+                        else
+                            tipDnA := jn(tipDnA, zTip)
+                            txtDnA := txtDnA == "" ? "RUN " + z.name : txtDnA
+                            if zRk > runDnR
+                                runDnR := zRk
+                                runDnC := zC
+                        if zoneRunEntries and zFit
+                            cands.push(Cand.new(zd, "RUN", 2, close, zd == 1 ? low : high, "RUN zóna " + zRange(z)))
+                    else
+                        if wickEntries and not zFit
+                            zTip += "\nwick " + fd(zStp) + " b. > stop → entry až na retapu"
+                        if zd == 1
+                            tipUpR := jn(tipUpR, zTip)
+                            txtUpR := txtUpR == "" ? z.name : txtUpR
+                            if zRk > respUpR
+                                respUpR  := zRk
+                                respUpC  := zC
+                                respUpPx := zLvl
+                            edgeBull := true
+                        else
+                            tipDnR := jn(tipDnR, zTip)
+                            txtDnR := txtDnR == "" ? z.name : txtDnR
+                            if zRk > respDnR
+                                respDnR  := zRk
+                                respDnC  := zC
+                                respDnPx := zLvl
+                            edgeBear := true
+                        if wickEntries and zFit
+                            cands.push(Cand.new(zd, "PROTI WICKU", 3, close, zd == 1 ? low : high, "zóna " + zRange(z)))
+                    z.lastEvt := bar_index
+                    z.state   := evt
+                    styleZone(z)
+                    if alZone
+                        alertMsg := am(alertMsg, zTip)
+                    if alRetapArm and not dup
+                        alertMsg := am(alertMsg, "Retap " + (zd == 1 ? "LONG @" : "SHORT @") + fp(zLvl) + " (" + zSrc + ")")
+                // jeden test zóny = jeden RESPECT: znovu povolit až po RUN, close uvnitř zóny, close na druhé straně
+                // nebo když cena od hrany odejde o víc než toleranci retapu (z.lastOut je tu ještě stará strana)
+                bool flip = z.lastOut != 0 and s == -z.lastOut
+                bool away = z.lastOut == 1 ? low > z.top + retapTol : z.lastOut == -1 ? high < z.bot - retapTol : true
+                if evt == 1 or evt == -1
+                    z.fresh := false
+                else if evt != 0 or s == 0 or away or flip
+                    z.fresh := true
+                if s != 0 and not shallow
+                    z.lastOut := s
+                z.prevS := s
+
+// ═════ KROK 4b – single prints: vyplnění po řádcích (každá uzavřená svíčka, i mimo session) ═════
+// VŠECHNY nevyplněné prints (nezávisle na vyhodnocení blízkých zón). Řádek je vyplněný, jakmile low ≤ řádek ≤ high.
+// Celý → pryč, horní / dolní část → zmenšit, svíčka uvnitř → rozdělit na dva SP. Platí i pro RUN skrz SP
+// (vyplní jen řádky, kterými svíčka prošla).
+// Příklad (krok 1): [30278, 30356] + svíčka 30300–30320 → [30278, 30299] a [30321, 30356];
+// pak svíčka 30330–30360 → [30278, 30299] a [30321, 30329]. Kresba se upraví na poslední svíčce.
+if conf and spz.size() > 0
+    for i = spz.size() - 1 to 0
+        Zone z = spz.get(i)
+        if high >= z.bot - z.st * 0.001 and low <= z.top + z.st * 0.001
+            int zb = math.round(z.bot / z.st)
+            int zt = math.round(z.top / z.st)
+            int lr = math.ceil(low / z.st - 1e-6)     // nejnižší řádek, na kterém svíčka obchodovala
+            int hr = math.floor(high / z.st + 1e-6)   // nejvyšší
+            if lr <= hr and lr <= zt and hr >= zb
+                // vyplněno hned na svíčce vzniku = neukazovat v historii
+                bool hist = bar_index > z.born
+                if lr <= zb and hr >= zt
+                    spRemove(z, hist)
+                    spz.remove(i)
+                else
+                    if hist
+                        spFinish(math.min(hr, zt) * z.st, math.max(lr, zb) * z.st, z.x0, z.st)
+                    if lr > zb and hr < zt
+                        // svíčka uvnitř → horní zbytek = nový SP, spodní zůstává v z
+                        // (close ≤ high < spodní hrana horního zbytku → close je pod ním)
+                        Zone zHiPart = Zone.new(zt * z.st, (hr + 1) * z.st, "SP", false, na, -1, -1, z.lastEvt, 0, true, true, z.st, z.x0, z.born, na)
+                        spz.push(zHiPart)
+                        z.top  := (lr - 1) * z.st
+                    else if lr > zb
+                        z.top := (lr - 1) * z.st
+                    else
+                        z.bot := (hr + 1) * z.st
+                    // strana close vůči zbytku
+                    int s2 = close > z.top ? 1 : close < z.bot ? -1 : 0
+                    if s2 != 0
+                        z.lastOut := s2
+                        z.prevS   := s2
+                    z.fresh := true
+// max. spMax nevyplněných – zahodit nejvzdálenější od ceny
+if conf and spz.size() > spMax
+    int cg2 = 0
+    while spz.size() > spMax and cg2 < 200
+        int   iF = 0
+        float dF = -1.0
+        for i = 0 to spz.size() - 1
+            Zone zc = spz.get(i)
+            float dd = close > zc.top ? close - zc.top : close < zc.bot ? zc.bot - close : 0.0
+            if dd > dF
+                dF := dd
+                iF := i
+        Zone zr = spz.remove(iF)
+        spRemove(zr, false)
+        cg2 += 1
+
+// FAIL texty podle strany: selhaný long = pohyb dolů → připojí se ke značce ↓ (a naopak)
+string failTxtUp = ""
+string failTxtDn = ""
+if failLv.size() > 0
+    for i = 0 to failLv.size() - 1
+        if failDr.get(i) == 1
+            failTxtDn := jn(failTxtDn, failTp.get(i))
+        else
+            failTxtUp := jn(failTxtUp, failTp.get(i))
+
+// ═════════════════════════════ BACKTEST – stav, funkce, simulace (jen při btOn) ═════════════════════════════
+// Simuluje každé NAKRESLENÉ entry ve směru biasu (záznam v Kroku 5) se stejným entry / SL / TP jako na grafu.
+// Výjimka RETAP·DISP: entry na close svíčky retapu (signál existuje až po close; limitka na levelu by se vyplnila
+// i na svíčkách, které level neudržely → započítat jen filly s příznivým close = pohled do budoucna).
+// Bez pohledu do budoucna: vyhodnocení od svíčky PO svíčce vstupu. Stav se mění jen na uzavřených svíčkách.
+// Pořadí na svíčce: typ dne (+ fronta čekajících) → sessions → otevřené obchody od nejstaršího (časový výstup před
+// svíčkou, SL / TP / MFE, časový výstup na close) → Krok 5 (nové obchody). Fixní TP (rr) se zapíše v okamžiku, kdy
+// se rozhodne (TP / SL / časový výstup před TP); MFE a cíle 1…100R (dosaženo %, EV) při uzavření obchodu.
+var array<float>   btTg    = array.from(1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 50.0, 100.0)
+var array<BtTrade> btOpen  = array.new<BtTrade>()
+var array<BtRes>   btPend  = array.new<BtRes>()            // fronta (pořadí zápisu) záznamů čekajících na typ dne
+var array<int>     btDayTy = array.new<int>()              // typ dne podle indexu RTH session: 1 trend, 2 range, 0 neúplná RTH (bez typu)
+var array<int>     btCntN  = array.new<int>(BT_NG, 0)      // uzavřené obchody (MFE, cíle)
+var array<int>     btCntW  = array.new<int>(BT_NG, 0)      // fixní TP zasažen
+var array<int>     btCntL  = array.new<int>(BT_NG, 0)      // SL před TP
+var array<int>     btCntT  = array.new<int>(BT_NG, 0)      // časový výstup před TP
+var array<float>   btSumR  = array.new<float>(BT_NG, 0.0)  // Σ R (fixní TP, po nákladech)
+var array<float>   btSumP  = array.new<float>(BT_NG, 0.0)  // Σ kladných R
+var array<float>   btSumM  = array.new<float>(BT_NG, 0.0)  // |Σ záporných R|
+var array<float>   btCum   = array.new<float>(BT_NG, 0.0)  // kumulativní R (fixní TP) v pořadí, kdy se rozhodl
+var array<float>   btPeak  = array.new<float>(BT_NG, 0.0)
+var array<float>   btDD    = array.new<float>(BT_NG, 0.0)  // max. drawdown (R)
+var array<int>     btStk   = array.new<int>(BT_NG, 0)      // běžící série ztrát (R < 0)
+var array<int>     btStkM  = array.new<int>(BT_NG, 0)
+var array<int>     btRch   = array.new<int>(BT_NG * BT_NT, 0)      // obchody s MFE ≥ cíl
+var array<float>   btEVs   = array.new<float>(BT_NG * BT_NT, 0.0)  // Σ výsledků při cíli (po nákladech)
+var int   btDayCur  = -1    // index aktuální / poslední RTH session
+var float btDO      = na    // RTH open / high / low / close (akumulátor typu dne; na = žádná běžící RTH)
+var float btDH      = na
+var float btDL      = na
+var float btDC      = na
+var bool  btDFull   = false // běžící RTH začala na skutečném začátku (graf nezačal uprostřed session)
+var int   btNTrend  = 0
+var int   btNRange  = 0
+var int   btNSess   = 0     // sessions (sessStr) na grafu
+var int   btLastTrS = -1    // poslední session (btNSess) s obchodem
+var int   btNSessTr = 0     // sessions s ≥ 1 obchodem
+var int   btT0      = na    // první / poslední uzavřená svíčka session (rozsah dat)
+var int   btT1      = na
+
+// výsledek při cíli x (R po nákladech): MFE ≥ x → +x; jinak R výstupu (SL = −1, časový výstup pod x)
+btOut(BtRes r, float x) =>
+    float o = r.mfe >= x - 1e-6 ? x : r.endK == 1 ? r.endR : math.min(r.endR, x)
+    o - r.costR
+
+// fixní TP: výsledek x (R po nákladech), res 1 TP / -1 SL / 0 čas → skupina g v pořadí, kdy se fixní TP / SL /
+// časový výstup rozhodl (počty, Σ R, PF, drawdown, série ztrát)
+btAddFix(int g, float x, int res) =>
+    if res == 1
+        btCntW.set(g, btCntW.get(g) + 1)
+    else if res == -1
+        btCntL.set(g, btCntL.get(g) + 1)
+    else
+        btCntT.set(g, btCntT.get(g) + 1)
+    btSumR.set(g, btSumR.get(g) + x)
+    if x > 0
+        btSumP.set(g, btSumP.get(g) + x)
+    else if x < 0
+        btSumM.set(g, btSumM.get(g) - x)
+    float cum = btCum.get(g) + x
+    float pk  = math.max(btPeak.get(g), cum)
+    btCum.set(g, cum)
+    btPeak.set(g, pk)
+    btDD.set(g, math.max(btDD.get(g), pk - cum))
+    int sk = x < 0 ? btStk.get(g) + 1 : 0
+    btStk.set(g, sk)
+    btStkM.set(g, math.max(btStkM.get(g), sk))
+    g
+
+// cíle 1…100R: uzavřený obchod → skupina g (N, dosaženo %, EV)
+btAddTg(int g, BtRes r) =>
+    btCntN.set(g, btCntN.get(g) + 1)
+    for j = 0 to BT_NT - 1
+        float tx = btTg.get(j)
+        int   ix = g * BT_NT + j
+        if r.mfe >= tx - 1e-6
+            btRch.set(ix, btRch.get(ix) + 1)
+        btEVs.set(ix, btEVs.get(ix) + btOut(r, tx))
+    g
+
+// záznam do skupiny typu dne (fixOnly = jen fixní TP, jinak cíle). Přímo jen když je typ dne známý a ve frontě nic
+// nečeká (přísné pořadí zápisu → drawdown / série ztrát); jinak na konec fronty btPend. Typ 0 (neúplná RTH) = nikam.
+btDayAdd(BtRes r) =>
+    bool dNow = r.dayId < btDayTy.size() and btPend.size() == 0
+    if dNow
+        int dt = btDayTy.get(r.dayId)
+        if dt > 0
+            int gd = dt == 1 ? BT_TREND : BT_RANGE
+            if r.fixOnly
+                btAddFix(gd, r.rFix, r.resFix)
+            else
+                btAddTg(gd, r)
+    else
+        btPend.push(r)
+        if btPend.size() > BT_MAXPEND
+            btPend.shift()
+    dNow
+
+// fronta btPend: zpracovat začátek, jehož typ dne je už známý (v pořadí zápisu); typ 0 (neúplná RTH) jen odebrat
+btFlush() =>
+    int  nF   = 0
+    bool more = btPend.size() > 0
+    while more
+        BtRes pr = btPend.get(0)
+        if pr.dayId < btDayTy.size()
+            btPend.shift()
+            int dt = btDayTy.get(pr.dayId)
+            if dt > 0
+                int gd = dt == 1 ? BT_TREND : BT_RANGE
+                if pr.fixOnly
+                    btAddFix(gd, pr.rFix, pr.resFix)
+                else
+                    btAddTg(gd, pr)
+            nF   += 1
+            more := btPend.size() > 0
+        else
+            more := false
+    nF
+
+// fixní TP se právě rozhodl (TP / SL / časový výstup před TP) → hned do statistik fixního TP: typ entry, CELKEM,
+// směr, časové okno, typ dne (neznámý / fronta neprázdná → záznam fixOnly do btPend)
+btBookFix(BtTrade t) =>
+    btAddFix(t.kix, t.rFix, t.resFix)
+    btAddFix(BT_TOT, t.rFix, t.resFix)
+    btAddFix(t.dir == 1 ? BT_LONG : BT_SHORT, t.rFix, t.resFix)
+    btAddFix(t.bkt, t.rFix, t.resFix)
+    if smtOn
+        btAddFix(t.withSMT ? BT_SMT : BT_NOSMT, t.rFix, t.resFix)
+    if t.dayId >= 0
+        btDayAdd(BtRes.new(t.kix, t.dir, t.bkt, t.dayId, 0.0, 0, 0.0, t.costR, t.rFix, t.resFix, t.withSMT, true))
+    t.resFix
+
+// uzavřený obchod → cíle 1…100R: typ entry, CELKEM, směr, časové okno, typ dne (neznámý → čeká v btPend)
+btFinish(BtRes r) =>
+    btAddTg(r.kix, r)
+    btAddTg(BT_TOT, r)
+    btAddTg(r.dir == 1 ? BT_LONG : BT_SHORT, r)
+    btAddTg(r.bkt, r)
+    if smtOn
+        btAddTg(r.withSMT ? BT_SMT : BT_NOSMT, r)
+    if r.dayId >= 0
+        btDayAdd(r)
+    r.kix
+
+// uzavřít obchod: endK 0 čas, 1 SL, 2 největší cíl; endR = R výstupu bez nákladů
+btClose(BtTrade t, int endK, float endR) =>
+    if not t.fixDone
+        // fixní TP nezasažen: SL = ztráta, jinak časový výstup s jeho R → zapsat teď (TP zasažený dřív už zapsaný je)
+        t.fixDone := true
+        t.resFix  := endK == 1 ? -1 : 0
+        t.rFix    := endR - t.costR
+        btBookFix(t)
+    btFinish(BtRes.new(t.kix, t.dir, t.bkt, t.dayId, t.mfe, endK, endR, t.costR, t.rFix, t.resFix, t.withSMT))
+
+// nový obchod z nakresleného entry (d směr, k typ, e / sl / tp / rk = entry, SL, TP, riziko; entry je vždy na close
+// svíčky vstupu nebo dřív známé ceně → vyhodnocení až od další svíčky)
+btCapture(int d, int k, float e, float sl, float tp, float rk) =>
+    // časové okno a RTH session podle času otevření svíčky entry (NY)
+    int hm  = hour(time, TZ) * 100 + minute(time, TZ)
+    int bg  = hm >= 930 and hm < 1030 ? BT_B0 : hm >= 1030 and hm < 1200 ? BT_B0 + 1 : hm >= 1200 and hm < 1400 ? BT_B0 + 2 : hm >= 1400 and hm < 1600 ? BT_B0 + 3 : BT_BX
+    int dId = (inRth or hm >= 1600) ? btDayCur : btDayCur + 1    // před 9:30 (vlastní session) = nadcházející RTH
+    // výstup Do Asie: btExH:btExM v den vstupu; vstup (close svíčky) po tomto čase → stejný čas další den
+    int xTs = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), btExH, btExM)
+    if nz(time_close, time) > xTs
+        int nx = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 12, 0) + 86400000   // poledne dalšího dne (změna času nevadí)
+        xTs := timestamp(TZ, year(nx, TZ), month(nx, TZ), dayofmonth(nx, TZ), btExH, btExM)
+    BtTrade t = BtTrade.new(d, k, bg, dId, e, sl, tp, rk, btCost / rk, bar_index, xTs)
+    int lastAgree = d == 1 ? (smtBullBar == bar_index ? smtBullPrev : smtBullBar) : (smtBearBar == bar_index ? smtBearPrev : smtBearBar)
+    t.withSMT := smtOn and not na(lastAgree) and bar_index - lastAgree >= 1 and bar_index - lastAgree <= smtLook
+    // limit otevřených obchodů: nejstarší se uzavře na close této svíčky (časový výstup)
+    if btOpen.size() >= BT_MAXOPEN
+        BtTrade o = btOpen.shift()
+        btClose(o, 0, (close - o.entry) * o.dir / o.risk)
+    btOpen.push(t)
+    k
+
+// ───────── Backtest na uzavřené svíčce (před Krokem 5 → obchod z této svíčky se vyhodnotí až od další) ─────────
+float btPrevC  = close[1]
+int   btPrevTC = time_close[1]
+if btOn and conf
+    // 1) typ dne: RTH skončila (první svíčka po 16:00; graf jen RTH: první svíčka další RTH) → trend / range
+    if ((not inRth and wasInRth) or rthStart) and not na(btDO)
+        float rg = btDH - btDL
+        // 0 = neúplná RTH (graf začal uprostřed session) → bez typu dne; její obchody jen v ostatních řádcích
+        int   ty = not btDFull ? 0 : rg > 0 and math.abs(btDC - btDO) >= btTrendThr * rg ? 1 : 2
+        if btDayTy.size() == btDayCur and btDayCur < BT_MAXDAYS
+            btDayTy.push(ty)   // i typ 0 → index = btDayCur (zarovnání s dayId)
+            if ty == 1
+                btNTrend += 1
+            else if ty == 2
+                btNRange += 1
+            // čekající záznamy → skupina typu dne (v pořadí zápisu, jen začátek fronty s už známým typem dne)
+            btFlush()
+        btDO := na
+    if rthStart
+        btDayCur += 1
+        btDFull  := bar_index > 0 or str.format_time(time, "HHmm", TZ) == "0930"
+        btDO     := open
+        btDH     := high
+        btDL     := low
+        btDC     := close
+    else if inRth and not na(btDO)
+        btDH := math.max(btDH, high)
+        btDL := math.min(btDL, low)
+        btDC := close
+    // 2) sessions a rozsah dat
+    if evOK and newSess
+        btNSess += 1
+        if na(btT0)
+            btT0 := time
+    if evOK
+        btT1 := time
+    // 3) otevřené obchody
+    bool sEnd = (not inSess and wasInSess) or newSess   // první svíčka po konci session
+    bool exA  = btExit == "Do Asie (čas NY)"
+    bool exS  = btExit == "Konec session"
+    bool exN  = btExit == "Po N svíčkách"
+    bool tpF  = btSameBar == "TP první"
+    if btOpen.size() > 0
+        // od nejstaršího obchodu (rozhodnutí na jedné svíčce se zapíší v pořadí vstupů)
+        int bi = 0
+        while bi < btOpen.size()
+            BtTrade t  = btOpen.get(bi)
+            int     eK = -1      // -1 dál otevřený, 0 čas, 1 SL, 2 největší cíl
+            float   eR = na
+            if bar_index > t.ebar
+                if (exS and sEnd) or (exA and time > t.xTs and nz(btPrevTC, time) <= t.xTs and gapMs >= 55 * 60000)
+                    // konec session / čas výstupu padl do skutečné pauzy ≥ 55 min (denní pauza, víkend, svátek, graf
+                    // jen RTH) → close poslední svíčky před ní; tato svíčka se už nevyhodnocuje. Svíčka přesně v čase
+                    // výstupu nebo malá díra v datech → běžná větev níže (close první svíčky v / po čase výstupu)
+                    eK := 0
+                    eR := (btPrevC - t.entry) * t.dir / t.risk
+                else
+                    float fav   = t.dir == 1 ? high : low
+                    float adv   = t.dir == 1 ? low : high
+                    bool  gSL   = (open - t.sl) * t.dir <= 0          // gap přes SL → SL zasažen hned (fill na SL dle specifikace, extrém ve prospěch se nepočítá)
+                    bool  hSL   = (adv - t.sl) * t.dir <= 0
+                    bool  favOK = not gSL and (tpF or not hSL)       // extrém ve prospěch se počítá (SL první: ne při SL)
+                    t.mfe := math.max(t.mfe, (open - t.entry) * t.dir / t.risk)
+                    if favOK
+                        t.mfe := math.max(t.mfe, (fav - t.entry) * t.dir / t.risk)
+                    if not t.fixDone and ((open - t.tp) * t.dir >= 0 or (favOK and (fav - t.tp) * t.dir >= 0))
+                        t.fixDone := true
+                        t.resFix  := 1
+                        t.rFix    := (t.tp - t.entry) * t.dir / t.risk - t.costR
+                        btBookFix(t)    // fixní TP rozhodnut teď → hned do statistik fixního TP (obchod běží dál k cílům)
+                    if hSL
+                        eK := 1
+                        eR := (t.sl - t.entry) * t.dir / t.risk   // výstup přesně na SL (= −1 R), i při gapu přes SL
+                    else if t.fixDone and t.mfe >= BT_TMAX - 1e-6
+                        // všechny cíle dosaženy a fixní TP vyhodnocen → výsledek je jistý
+                        eK := 2
+                        eR := BT_TMAX
+                    else if (exA and time >= t.xTs) or (exN and bar_index - t.ebar >= btMaxBars)
+                        eK := 0
+                        eR := (close - t.entry) * t.dir / t.risk
+            if eK >= 0
+                btClose(t, eK, eR)
+                btOpen.remove(bi)
+            else
+                bi += 1
+
+// ═════ KROK 5 – entry (jedno na směr a svíčku) ═════
+bool entUp = false
+bool entDn = false
+if evOK and cands.size() > 0
+    // nejvyšší povolená priorita na každé straně (DISP/RUN se nenavrhuje na svíčce s opačným rejection wickem)
+    int pL = 0
+    int pS = 0
+    for c0 in cands
+        bool ok0 = (c0.prio == 4 ? entryMode != "Jen Displacement" : c0.prio == 3 ? wickEntries : entryMode != "Jen Retap") and not (c0.prio <= 2 and (c0.dir == 1 ? bearShape : bullShape))
+        if ok0
+            if c0.dir == 1
+                pL := math.max(pL, c0.prio)
+            else
+                pS := math.max(pS, c0.prio)
+    // long i short na jedné svíčce při biasu Oba = chop → žádné entry (tiše)
+    bool conflict = pL > 0 and pS > 0 and bias == "Oba"
+    if not conflict
+        int nZe = zones.size()
+        int nZa = nZe + spz.size()
+        for d = 0 to 1
+            int    eDir  = d == 0 ? 1 : -1
+            Cand   best  = na
+            string types = ""
+            for c in cands
+                if c.dir == eDir
+                    bool okMode = (c.prio == 4 ? entryMode != "Jen Displacement" : c.prio == 3 ? wickEntries : entryMode != "Jen Retap") and not (c.prio <= 2 and (eDir == 1 ? bearShape : bullShape))
+                    if okMode
+                        if not str.contains(types, c.typ)
+                            types := types == "" ? c.typ : types + " + " + c.typ
+                        if na(best) or c.prio > best.prio or (c.prio == best.prio and (c.entry - best.entry) * eDir > 0)
+                            best := c
+            if not na(best)
+                bool biasOK = eDir == 1 ? bias != "Short" : bias != "Long"
+                // odstup od minulého nakresleného entry stejného směru (žádné shluky minutu po minutě)
+                int  lastB  = eDir == 1 ? lastEntBarL : lastEntBarS
+                bool gapOK  = na(lastB) or bar_index - lastB >= entryGap
+                if (biasOK or showAgainstBias) and gapOK
+                    float eBuf  = slBufTicks * syminfo.mintick
+                    float ePx   = best.entry
+                    float eSL0  = slMode == "Fixní stop" ? ePx - eDir * stopPts : best.sp - eDir * eBuf
+                    float eRisk = math.max((ePx - eSL0) * eDir, syminfo.mintick)
+                    float eSL   = ePx - eDir * eRisk
+                    float eTP   = ePx + eDir * rr * eRisk
+                    float tpD   = rr * eRisk
+                    // varování (jen v tooltipu)
+                    string warn = ""
+                    if slMode != "Fixní stop" and eRisk > stopPts
+                        warn += "\n⚠ SL " + fd(eRisk) + " b. > stop" + (best.prio == 4 ? "" : " – čekej retap")
+                    if slMode == "Fixní stop" and (ePx - best.sp) * eDir > stopPts
+                        warn += "\n" + (best.prio == 4 ? "⚠ invalidace dál než stop" : "⚠ wick delší než stop")
+                    // TP za hranou range
+                    if rangeValid()
+                        if eDir == 1 and swH > ePx and swH - ePx < tpD
+                            warn += "\n⚠ TP za horní hranou range " + fp(swH) + " (+" + fd(swH - ePx) + " b.)"
+                        if eDir == -1 and swL < ePx and ePx - swL < tpD
+                            warn += "\n⚠ TP za dolní hranou range " + fp(swL) + " (-" + fd(ePx - swL) + " b.)"
+                    // nejbližší zóna / single print v cestě k TP
+                    float  zw  = na
+                    string zwN = ""
+                    if nZa > 0
+                        for k = 0 to nZa - 1
+                            Zone  z  = zAt(k, nZe)
+                            bool  zl = z.isAuto or z.isSP or not zonesTodayOnly or zoneEvalOK
+                            float ze = eDir == 1 ? z.bot : z.top
+                            if zl and (ze - ePx) * eDir > 0
+                                if na(zw) or (ze - ePx) * eDir < (zw - ePx) * eDir
+                                    zw  := ze
+                                    zwN := z.name
+                    if not na(zw) and math.abs(zw - ePx) < tpD
+                        warn += "\n⚠ " + (zwN == "SP" ? "single print " : "zóna " + zwN + " ") + fp(zw) + " v cestě k TP (" + (eDir == 1 ? "+" : "-") + fd(math.abs(zw - ePx)) + " b.)"
+                    if not na(stopAtr) and stopAtr < volHiThr
+                        warn += "\n⚠ vysoká vol. (stop = " + fd(stopAtr) + "× ATR)"
+                    if (eDir == 1 ? pS : pL) > 0
+                        warn += "\n⚠ i " + (eDir == 1 ? "SHORT" : "LONG") + " signál na svíčce"
+                    // značka: drobný trojúhelník ▲▼, detaily v tooltipu (vč. DISP / zóny / FAIL této svíčky)
+                    bool   against = not biasOK
+                    string dirT    = eDir == 1 ? "LONG" : "SHORT"
+                    string srcT    = best.prio >= 3 ? " (" + best.src + ")" : ""
+                    string evTip   = eDir == 1 ? jn(jn(tipUpA, tipUpR), failTxtUp) : jn(jn(tipDnA, tipDnR), failTxtDn)
+                    string eTip    = dirT + " · " + types + srcT + (against ? " · proti biasu" : "") + "\nE " + fp(ePx) + " · SL " + fp(eSL) + " (" + fd(eRisk) + " b.) · TP " + fp(eTP) + " (" + fd(rr) + "R)" + warn + (evTip == "" ? "" : "\n" + evTip)
+                    color  eCol    = against ? color.new(cNeut, T_AGAINST) : eDir == 1 ? cBull : cBear
+                    label  eLb     = glyph(eDir == 1 ? low : high, eDir == 1 ? GL_LONG : GL_SHORT, shortTyp(best.typ), eDir == 1 ? -1 : 1, eCol, eTip)
+                    // tenké čáry Entry / SL / TP
+                    line eLe = na
+                    line eLs = na
+                    line eLt = na
+                    if showEntryLines
+                        int x2 = bar_index + entryLineBars
+                        eLe := line.new(bar_index, ePx, x2, ePx, color=against ? color.new(cNeut, T_ELINE_AG) : color.new(cRetap, T_ELINE), style=against ? ST_ENTRY_AG : ST_ENTRY, width=W_LINE)
+                        eLs := line.new(bar_index, eSL, x2, eSL, color=against ? color.new(cNeut, T_SLTP_AG) : color.new(cBear, T_SLTP), style=ST_SLTP, width=W_LINE)
+                        eLt := line.new(bar_index, eTP, x2, eTP, color=against ? color.new(cNeut, T_SLTP_AG) : color.new(cBull, T_SLTP), style=ST_SLTP, width=W_LINE)
+                    entries.push(EntryDraw.new(eLb, eLe, eLs, eLt))
+                    if entries.size() > maxEntryDraw
+                        EntryDraw od = entries.shift()
+                        if not na(od.lb)
+                            label.delete(od.lb)
+                        if not na(od.le)
+                            line.delete(od.le)
+                        if not na(od.ls)
+                            line.delete(od.ls)
+                        if not na(od.lt)
+                            line.delete(od.lt)
+                    if eDir == 1
+                        entUp       := true
+                        lastEntBarL := bar_index
+                    else
+                        entDn       := true
+                        lastEntBarS := bar_index
+                    if not against
+                        lastEntryDir := eDir
+                        lastEntryTyp := types
+                        lastEntryPx  := ePx
+                        lastEntryBar := bar_index
+                        if alEntry
+                            alertMsg := am(alertMsg, dirT + " " + types + " E=" + fp(ePx) + " SL=" + fp(eSL) + " TP=" + fp(eTP) + str.replace_all(warn, "\n", " ") + " · " + str.replace_all(ctxLine(close), "\n", " · "))
+                    // backtest: nakreslené entry ve směru biasu = obchod se stejným entry / SL / TP
+                    // (Jedna pozice naráz: jen když není otevřený jiný obchod)
+                    // RETAP·DISP: signál existuje až po close svíčky retapu → entry na close (limitka na levelu by se
+                    // vyplnila i na svíčkách, které level neudržely; brát jen filly s příznivým close = pohled do
+                    // budoucna). SL: fixní stop = stejná vzdálenost, za wick/level = strukturální SL z grafu. Ostatní
+                    // typy = přesně ePx / eSL / eTP / eRisk z grafu.
+                    if btOn and not against and (btMode == "Všechny signály" or btOpen.size() == 0)
+                        int   bK  = btKey(best)
+                        float bE  = bK == 0 ? close : ePx
+                        float bSL = slMode == "Fixní stop" ? bE - eDir * stopPts : eSL
+                        float bRk = math.max((bE - bSL) * eDir, syminfo.mintick)
+                        btCapture(eDir, bK, bE, bE - eDir * bRk, bE + eDir * rr * bRk, bRk)
+                        if btLastTrS != btNSess
+                            btLastTrS := btNSess
+                            btNSessTr += 1
+
+// ═════ KROK 6 – značky událostí (jedna značka na stranu svíčky, drobné znaky bez textu) ═════
+if evOK
+    bool foldUp = entUp
+    bool foldDn = entDn
+    // ↑: šipka (DISP; RUN zóny jen při showZoneRun) nebo kosočtverec RESPECT – jen když na svíčce není long entry.
+    // RUN zóny bez šipky: text RUN jde do tooltipu kosočtverce / entry (a do alertu).
+    bool arrUp = dispUpEv or (showZoneRun and tipUpA != "")
+    bool arrDn = dispDnEv or (showZoneRun and tipDnA != "")
+    if not entUp
+        if arrUp
+            color cA = dispUpEv ? color.new(cBull, T_DISP) : color.new(runUpR > 0 ? runUpC : cSP, T_ZRUN)
+            pushLabel(evtLabels, glyph(low, GL_UP, txtUpA, -1, cA, jn(jn(tipUpA, tipUpR), failTxtUp)), MAX_EVT)
+            foldUp := true
+        else if tipUpR != "" and not na(respUpPx)
+            pushLabel(evtLabels, glyph(respUpPx, GL_RESP, txtUpR, 0, color.new(respUpR > 0 ? respUpC : cSP, T_RESP), jn(tipUpR, tipUpA)), MAX_EVT)
+    // ↓
+    if not entDn
+        if arrDn
+            color cA = dispDnEv ? color.new(cBear, T_DISP) : color.new(runDnR > 0 ? runDnC : cSP, T_ZRUN)
+            pushLabel(evtLabels, glyph(high, GL_DN, txtDnA, 1, cA, jn(jn(tipDnA, tipDnR), failTxtDn)), MAX_EVT)
+            foldDn := true
+        else if tipDnR != "" and not na(respDnPx)
+            pushLabel(evtLabels, glyph(respDnPx, GL_RESP, txtDnR, 0, color.new(respDnR > 0 ? respDnC : cSP, T_RESP), jn(tipDnR, tipDnA)), MAX_EVT)
+    // FAIL displacementu: drobný křížek na prolomeném levelu (pokud už není v tooltipu značky opačného směru);
+    // FAIL retapu zóny je tichý (Krok 2) – sem se nedostane
+    if failLv.size() > 0
+        for i = 0 to failLv.size() - 1
+            int  fDir   = failDr.get(i)
+            bool folded = fDir == 1 ? foldDn : foldUp
+            if alFail
+                alertMsg := am(alertMsg, str.replace_all(failTp.get(i), "\n", " "))
+            if not folded
+                pushLabel(evtLabels, glyph(failLv.get(i), GL_FAIL, "FAIL", 0, color.new(cNeut, T_FAIL), failTp.get(i)), MAX_EVT)
+    if alRej and (bearShape or bullShape)
+        alertMsg := am(alertMsg, bearShape ? "REJECTION ↓ wick " + fp(high) + (edgeBear ? " (u hrany)" : "") : "REJECTION ↑ wick " + fp(low) + (edgeBull ? " (u hrany)" : ""))
+
+// ═════ KROK 7 – údržba kreseb ═════
+if evOK
+    // aktuální range: jeden tečkovaný box + slabý střed; při změně hran → starý do historie, nový box
+    bool rgOK = showRangeBox and rangeValid() and not na(swHBar) and not na(swLBar)
+    if not na(curBox) and (not rgOK or swH != boxTop or swL != boxBot)
+        freezeRange(rangeHist, curBox, curMid, bar_index)
+        curBox := na
+        curMid := na
+    if rgOK
+        float mid = (swH + swL) / 2
+        if na(curBox)
+            int lft = math.min(swHBar, swLBar)
+            // minulé range nesmí zasahovat do nového boxu: oříznout na jeho levou hranu, celé překryté smazat
+            if rangeHist.size() > 0
+                for i = rangeHist.size() - 1 to 0
+                    box hb = rangeHist.get(i)
+                    if hb.get_right() > lft
+                        if hb.get_left() >= lft
+                            hb.delete()
+                            rangeHist.remove(i)
+                        else
+                            hb.set_right(lft)
+            curBox := box.new(lft, swH, bar_index + 3, swL, border_color=color.new(cNeut, T_RANGE_BRD), border_width=W_LINE, border_style=ST_RANGE, bgcolor=color.new(cNeut, T_RANGE_BG))
+            curMid := line.new(lft, mid, bar_index + 3, mid, color=color.new(cNeut, T_RANGE_MID), style=ST_RANGE, width=W_LINE)
+            boxTop := swH
+            boxBot := swL
+        else
+            curBox.set_right(bar_index + 3)
+            if not na(curMid)
+                curMid.set_x2(bar_index + 3)
+    // price discovery: bez boxu, jen slabá tečkovaná čára rozvíjejícího se extrému
+    bool dvH = showRangeBox and orDone and na(swH) and zzDir >= 0 and not na(legHi) and not na(legHiBar)
+    if dvH
+        if na(devHiLn)
+            devHiLn := line.new(legHiBar, legHi, bar_index + 3, legHi, color=color.new(cNeut, T_DEV), style=ST_RANGE, width=W_LINE)
+        else
+            devHiLn.set_xy1(legHiBar, legHi)
+            devHiLn.set_xy2(bar_index + 3, legHi)
+    else if not na(devHiLn)
+        devHiLn.delete()
+        devHiLn := na
+    bool dvL = showRangeBox and orDone and na(swL) and zzDir <= 0 and not na(legLo) and not na(legLoBar)
+    if dvL
+        if na(devLoLn)
+            devLoLn := line.new(legLoBar, legLo, bar_index + 3, legLo, color=color.new(cNeut, T_DEV), style=ST_RANGE, width=W_LINE)
+        else
+            devLoLn.set_xy1(legLoBar, legLo)
+            devLoLn.set_xy2(bar_index + 3, legLo)
+    else if not na(devLoLn)
+        devLoLn.delete()
+        devLoLn := na
+    for rt in retaps
+        if not na(rt.ln)
+            rt.ln.set_x2(bar_index + 3)
+    if showOpenLine and not na(openLn)
+        openLn.set_x2(bar_index + 2)
+
+// Konec session: range do historie, čekající retapy zrušit, kresby zastavit
+// (graf jen RTH nemá svíčku mimo session → tam to udělá Krok 1 další session)
+if conf and not inSess and wasInSess
+    freezeRange(rangeHist, curBox, curMid, bar_index - 1)
+    curBox := na
+    curMid := na
+    boxTop := na
+    boxBot := na
+    if not na(devHiLn)
+        devHiLn.delete()
+        devHiLn := na
+    if not na(devLoLn)
+        devLoLn.delete()
+        devLoLn := na
+    for rt in retaps
+        if not na(rt.ln)
+            rt.ln.delete()
+    retaps.clear()
+    orDone := false
+    swH    := na
+    swL    := na
+    brkDir := 0
+    zzDir  := 0
+    if not na(openLn)
+        openLn.set_x2(bar_index - 1)
+
+// ═════ KRESBA ZÓN – jen blízko ceny, na poslední svíčce (historie i každá realtime svíčka) ═════
+// Vzdálené boxy roztahují cenovou osu (autoscale) → kreslí se jen zóny / auto levely / single prints do
+// zoneShowPts od close, od bar_index − zoneBack (SP a auto levely nejdřív od svého vzniku) do bar_index + 10,
+// bez extend.right. Zóny mimo dosah se smažou. Vyhodnocení zón (Krok 4) se tím nemění.
+// Auto levely jen v běžící session (stejné pravidlo jako stavová tečka) – mimo ni by ukazovaly levely
+// minulé session pod stejnými názvy, zatímco tooltip ukazuje náhled příští session.
+// session opravdu běží (graf jen RTH: poslední svíčka 15:59 je „v session“ i večer / o víkendu; 20 min rezerva)
+bool liveNow   = barstate.isrealtime or timenow < time_close + 20 * 60000
+bool sessLive  = inSess and liveNow
+// 1. svíčka session se ještě tvoří → Krok 1 (reset) ještě neproběhl, stav je z minulé session
+bool sessFresh = sessLive and newSess and not conf
+bool stLive    = sessLive and not sessFresh
+if barstate.islast
+    int xL   = math.max(bar_index - zoneBack, 0)
+    int xR   = bar_index + 10
+    int nZd0 = zones.size()
+    int nZd  = nZd0 + spz.size()
+    if nZd > 0
+        for k = 0 to nZd - 1
+            Zone  z    = zAt(k, nZd0)
+            float dz   = close > z.top ? close - z.top : close < z.bot ? z.bot - close : 0.0
+            bool  want = (z.isSP ? spShow : showZones) and (zoneShowPts <= 0 or dz <= zoneShowPts) and (not z.isAuto or stLive)
+            if want
+                int x1 = z.isSP or z.isAuto ? math.min(math.max(nz(z.x0, xL), xL), bar_index) : xL
+                if z.isSP
+                    spDraw(z, x1, xR)
+                else
+                    zDraw(z, x1, xR)
+            else
+                zErase(z)
+
+// ───────── Tečky rejection wicků (jen uzavřené svíčky v session) ─────────
+float dotOff  = DOT_OFF * atrN
+bool  dotOK   = conf and inSess and rejDots != "Vypnuto"
+bool  allDots = rejDots == "Všechny"
+bool  bigBear = bearShape and (edgeBear or (hiVol and allDots))
+bool  bigBull = bullShape and (edgeBull or (hiVol and allDots))
+plotchar(dotOK and allDots and bearShape and not bigBear ? high + dotOff : na, "Rejection wick ↓", GL_DOT, location.absolute, color=color.new(cBear, T_DOT), size=SZ_DOT, display=display.pane)
+plotchar(dotOK and bigBear ? high + dotOff : na, "Rejection ↓ u hrany / objem", GL_DOT_BIG, location.absolute, color=color.new(cBear, T_DOT_BIG), size=SZ_DOT, display=display.pane)
+plotchar(dotOK and allDots and bullShape and not bigBull ? low - dotOff : na, "Rejection wick ↑", GL_DOT, location.absolute, color=color.new(cBull, T_DOT), size=SZ_DOT, display=display.pane)
+plotchar(dotOK and bigBull ? low - dotOff : na, "Rejection ↑ u hrany / objem", GL_DOT_BIG, location.absolute, color=color.new(cBull, T_DOT_BIG), size=SZ_DOT, display=display.pane)
+
+// ───────── Alert (jeden souhrnný za svíčku) ─────────
+if alertMsg != ""
+    alert("PA Asistent " + syminfo.ticker + ": " + alertMsg, alert.freq_once_per_bar_close)
+
+// ═════════════════════════════ STAV: tečka + volitelný mini panel ═════════════════════════════
+var label stDot  = na
+var table tb     = na
+if barstate.isfirst and showTable
+    tb := table.new(tPos, 2, 4, bgcolor=color.new(cNeut, T_PANEL_BG), frame_color=color.new(cNeut, T_PANEL_FRM), frame_width=W_LINE, border_width=0)
+
+if barstate.islast and (showStatus or showTable)
+    float  px        = close
+    // liveNow / sessFresh / stLive = globálně před KRESBOU ZÓN (stejné pravidlo pro auto zóny i tooltip)
+    // RTH dnešního dne opravdu běží a její start je už zpracovaný (pdh/onh platí)
+    bool   rthLive   = inRth and liveNow and not (rthStart and not conf)
+    string offTxt    = "Mimo session · start " + sessStartTxt + " NY"
+    string ctxT      = stLive ? ctxLine(px) : sessFresh ? "Session začíná – čekej na close 1. svíčky" : offTxt
+    // volatilita
+    bool   hiVolS = not na(stopAtr) and stopAtr < volHiThr
+    string vState = na(stopAtr) ? "—" : hiVolS ? "Vysoká" : stopAtr > volLoThr ? "Nízká" : "Normální"
+    color  vCol   = na(stopAtr) ? cNeut : hiVolS ? cBear : stopAtr > volLoThr ? cNeut : cBull
+    string vExp   = na(atrRatio) ? "" : atrRatio > 1.3 ? " · expanze" : atrRatio < 0.75 ? " · komprese" : ""
+    string volT   = "ATR " + fd(atr) + " b. · stop = " + fd(stopAtr) + "× ATR · " + vState + vExp
+    // nejbližší zóny / single prints (ruční a SP platí i mimo session, auto jen v běžící session)
+    float  zUp  = na
+    string zUpN = ""
+    float  zDn  = na
+    string zDnN = ""
+    string inZ  = ""
+    int    nZs  = zones.size()
+    int    nZt  = nZs + spz.size()
+    if nZt > 0
+        for k = 0 to nZt - 1
+            Zone z = zAt(k, nZs)
+            bool zShow = z.isAuto ? stLive : z.isSP ? true : (not zonesTodayOnly or isToday)
+            if zShow
+                if z.bot > px and (na(zUp) or z.bot < zUp)
+                    zUp  := z.bot
+                    zUpN := z.name
+                if z.top < px and (na(zDn) or z.top > zDn)
+                    zDn  := z.top
+                    zDnN := z.name
+                if px >= z.bot and px <= z.top
+                    inZ := inZ == "" ? z.name : inZ + ", " + z.name
+    // mimo session: náhled auto levelů aktuální / příští session (stejná volba jako v Kroku 1)
+    if not stLive and useAuto
+        array<float>  aPx = array.from(rthLive ? pdh : (rthFull ? rthHi : na), rthLive ? pdl : (rthFull ? rthLo : na), rthLive ? onh : (onValid ? onHi : na), rthLive ? onl : (onValid ? onLo : na))
+        array<string> aNm = array.from("PDH", "PDL", "ONH", "ONL")
+        for k = 0 to 3
+            float ap = aPx.get(k)
+            if not na(ap)
+                float  aT = ap + autoHalf
+                float  aB = ap - autoHalf
+                string an = aNm.get(k)
+                if aB > px and (na(zUp) or aB < zUp)
+                    zUp  := aB
+                    zUpN := an
+                if aT < px and (na(zDn) or aT > zDn)
+                    zDn  := aT
+                    zDnN := an
+                if px >= aB and px <= aT
+                    inZ := inZ == "" ? an : inZ + ", " + an
+    string zT = "\nZóna nad: " + (na(zUp) ? "—" : zUpN + " " + fp(zUp) + " (+" + fd(zUp - px) + " b.)") + "\nZóna pod: " + (na(zDn) ? "—" : zDnN + " " + fp(zDn) + " (-" + fd(px - zDn) + " b.)") + (inZ == "" ? "" : "\nCena v zóně: " + inZ)
+    if useSP
+        zT += "\nSingle prints: " + str.tostring(spz.size()) + " nevyplněných (okno " + str.tostring(spWin) + " min z 1m svíček · krok " + fd(spStep) + ")"
+    // čekající retapy (max. 2, nejnovější první)
+    string rtT  = ""
+    int    rtD0 = 0
+    int    nR   = retaps.size()
+    if nR > 0 and stLive
+        int shown = 0
+        for i = nR - 1 to 0
+            if shown < 2
+                Retap rq  = retaps.get(i)
+                int   rem = math.max(retapBars - (bar_index - rq.start), 0)
+                rtT := rtT + (rtT == "" ? "" : "\n") + "Retap " + (rq.dir == 1 ? "LONG @" : "SHORT @") + fp(rq.level) + " (zbývá " + str.tostring(rem) + " sv.) · " + rq.src
+                if shown == 0
+                    rtD0 := rq.dir
+                shown += 1
+    // barva tečky = kontext
+    color stCol = color.new(cNeut, T_STAT_OFF)
+    if stLive
+        stCol := color.new(orDone and na(swH) and not na(swL) ? cBull : orDone and na(swL) and not na(swH) ? cBear : rtD0 == 1 ? cBull : rtD0 == -1 ? cBear : cNeut, T_STAT)
+    // tooltip = kompletní stav
+    string tip = "PA Asistent · " + syminfo.ticker + "\n" + ctxT
+    if hiVolS
+        tip += "\n⚠ Vysoká volatilita – stop jen " + fd(stopAtr) + "× ATR, hrozí vyhození"
+    tip += "\nVolatilita: " + volT + " · ø svíčka " + fd(avgRange5) + " b."
+    tip += "\nBias: " + bias
+    if smtOn
+        tip += "\nPoslední SMT: " + (na(lastSmtBar) ? "—" : (lastSmtDir == 1 ? "↑ bullish" : "↓ bearish") + " · před " + str.tostring(bar_index - lastSmtBar) + " sv.")
+    tip += zT
+    if rtT != ""
+        tip += "\n" + rtT
+    if stLive and lastDispDir != 0 and not na(lastDispBar)
+        tip += "\nPoslední DISP " + (lastDispDir == 1 ? "↑ " : "↓ ") + fp(lastDispLevel) + " · před " + str.tostring(bar_index - lastDispBar) + " sv."
+    if lastEntryDir != 0 and not na(lastEntryBar)
+        tip += "\nPoslední entry: " + (lastEntryDir == 1 ? "LONG " : "SHORT ") + lastEntryTyp + " " + fp(lastEntryPx) + " · před " + str.tostring(bar_index - lastEntryBar) + " sv."
+    if timeframe.period != "1"
+        tip += "\n⚠ Laděno pro 1m graf (aktuální TF " + timeframe.period + ")"
+    // stavová tečka (jeden label), vytvoří se jednou, pak se jen posouvá
+    if showStatus
+        if na(stDot)
+            stDot := label.new(bar_index + 4, px, "", xloc=xloc.bar_index, yloc=yloc.price, color=stCol, style=label.style_circle, size=SZ_STATUS, tooltip=tip)
+        else
+            stDot.set_xy(bar_index + 4, px)
+            stDot.set_color(stCol)
+            stDot.set_tooltip(tip)
+    // volitelný mini panel (4 řádky)
+    if showTable and not na(tb)
+        string rgT = "—"
+        if stLive and rangeValid()
+            float sz = swH - swL
+            rgT := fp(swL) + " – " + fp(swH) + " · " + fd(sz) + " b. = " + fd(sz / stopPts) + "× stop · cena " + str.tostring(math.round((px - swL) / sz * 100)) + " %"
+        else if stLive and orDone and na(swH) and not na(swL)
+            rgT := "discovery ↑ · high " + fp(legHi)
+        else if stLive and orDone and na(swL) and not na(swH)
+            rgT := "discovery ↓ · low " + fp(legLo)
+        pRow(tb, 0, "Kontext", stLive ? ctxShort(px) : sessFresh ? "Start session" : "Mimo session", stLive ? stCol : cNeut, ctxT)
+        pRow(tb, 1, "Range", rgT, cNeut, "")
+        pRow(tb, 2, "Volatilita", "ATR " + fd(atr) + " · stop " + fd(stopAtr) + "× · " + vState, vCol, volT)
+        pRow(tb, 3, "Bias", bias, bias == "Long" ? cBull : bias == "Short" ? cBear : cNeut, "")
+
+// ═════════════════════════════ BACKTEST – tabulka (jen při btOn) ═════════════════════════════
+// Pevné řádky: 0 záhlaví, 1 názvy sloupců, 2–7 typy entry (jen s daty), 8 CELKEM, 9 LONG, 10 SHORT, 11 TREND dny,
+// 12 RANGE dny, 13–16 časová okna, 17 jiný čas (jen s daty), 18 patička. Nevyplněné řádky se nezobrazí.
+// N = uzavřené obchody (MFE, dosaženo %, EV); Win % / Σ R / PF / DD / série = obchody s rozhodnutým fixním TP
+// (i ještě otevřené, které po fixním TP běží dál k cílům 1–100R)
+// počet obchodů s rozhodnutým fixním TP (TP / SL / časový výstup před TP)
+btNFix(int g) => btCntW.get(g) + btCntL.get(g) + btCntT.get(g)
+// skupina má nějaká data (uzavřený obchod nebo rozhodnutý fixní TP)
+btHas(int g) => btCntN.get(g) > 0 or btNFix(g) > 0
+// dosaženo % pro cíl j (index do btTg)
+btRchS(int g, int j) =>
+    int n = btCntN.get(g)
+    n > 0 ? str.tostring(math.round(100.0 * btRch.get(g * BT_NT + j) / n)) : "—"
+// EV (R) pro cíl j
+btEVv(int g, int j) =>
+    int n = btCntN.get(g)
+    n > 0 ? btEVs.get(g * BT_NT + j) / n : na
+// barva R: kladné bull, záporné bear, nula / bez dat neutrální
+colR(float x) => na(x) or math.abs(x) < 0.005 ? color.new(cNeut, T_BT_TXT) : x > 0 ? cBull : cBear
+btCell(table tt, int c, int r, string s, color tc, color bg, string tip) =>
+    table.cell(tt, c, r, s, text_color=tc, text_halign=c == 0 ? text.align_left : text.align_right, text_size=SZ_BT, bgcolor=bg, tooltip=tip)
+// jeden řádek statistiky skupiny g (tooltip názvu = kompletní statistika vč. všech cílů)
+btRow(table tt, int r, int g, string nm, color bg, string info) =>
+    int    n   = btCntN.get(g)
+    int    w   = btCntW.get(g)
+    int    l   = btCntL.get(g)
+    int    nF  = btNFix(g)      // obchody s rozhodnutým fixním TP (Win % / Σ R / PF / DD / série)
+    float  sm  = btSumR.get(g)
+    float  sM  = btSumM.get(g)
+    color  tc  = color.new(cNeut, T_BT_TXT)
+    string pfS = nF > 0 and sM > 0 ? str.tostring(btSumP.get(g) / sM, "0.00") : "—"
+    string wrS = w + l > 0 ? str.tostring(math.round(100.0 * w / (w + l))) : "—"
+    float  avg = nF > 0 ? sm / nF : na
+    string tip = info
+    if nF > 0
+        tip += "\nFixní TP " + fd(rr) + "R: " + str.tostring(nF) + " obch. · TP " + str.tostring(w) + " / SL " + str.tostring(l) + " / čas " + str.tostring(btCntT.get(g)) + " · Win " + wrS + " %"
+        tip += "\nØ R " + fR(avg) + " · Σ R " + fR(sm) + " · PF " + pfS + " · max. DD " + str.tostring(btDD.get(g), "0.00") + " R · série ztrát " + str.tostring(btStkM.get(g))
+    if n > 0
+        tip += "\nUzavřené obchody N " + str.tostring(n) + " · cíl: dosaženo % · EV (R po nákladech)"
+        for j = 0 to BT_NT - 1
+            tip += "\n" + str.tostring(btTg.get(j)) + "R: " + btRchS(g, j) + " % · EV " + fR(btEVv(g, j))
+    else
+        tip += nF > 0 ? "\nCíle 1–100R: zatím žádný uzavřený obchod." : "\nZatím žádný obchod."
+    float e2   = btEVv(g, 1)
+    float e5   = btEVv(g, 3)
+    float e10  = btEVv(g, 4)
+    float e20  = btEVv(g, 5)
+    float e50  = btEVv(g, 7)
+    float e100 = btEVv(g, 8)
+    btCell(tt, 0, r, nm, tc, bg, tip)
+    btCell(tt, 1, r, str.tostring(n), tc, bg, "")
+    btCell(tt, 2, r, wrS, tc, bg, "")
+    btCell(tt, 3, r, nF > 0 ? fR(sm) : "—", colR(sm), bg, "")
+    btCell(tt, 4, r, pfS, tc, bg, "")
+    btCell(tt, 5, r, btRchS(g, 3), tc, bg, "")
+    btCell(tt, 6, r, btRchS(g, 4), tc, bg, "")
+    btCell(tt, 7, r, btRchS(g, 5), tc, bg, "")
+    btCell(tt, 8, r, btRchS(g, 7), tc, bg, "")
+    btCell(tt, 9, r, btRchS(g, 8), tc, bg, "")
+    btCell(tt, 10, r, fR(e2), colR(e2), bg, "")
+    btCell(tt, 11, r, fR(e5), colR(e5), bg, "")
+    btCell(tt, 12, r, fR(e10), colR(e10), bg, "")
+    btCell(tt, 13, r, fR(e20), colR(e20), bg, "")
+    btCell(tt, 14, r, fR(e50), colR(e50), bg, "")
+    btCell(tt, 15, r, fR(e100), colR(e100), bg, "")
+    btCell(tt, 16, r, nF > 0 ? str.tostring(btDD.get(g), "0.00") : "—", tc, bg, "")
+    btCell(tt, 17, r, nF > 0 ? str.tostring(btStkM.get(g)) : "—", tc, bg, "")
+    n
+
+var table btTb = na
+if barstate.isfirst and btOn
+    btTb := table.new(btTPos, BT_COLS, BT_ROWS, bgcolor=color.new(cNeut, T_BT_BG), frame_color=color.new(cNeut, T_BT_FRM), frame_width=W_LINE, border_width=0)
+    table.merge_cells(btTb, 0, 0, BT_COLS - 1, 0)                        // záhlaví přes celou šířku
+    table.merge_cells(btTb, 0, BT_ROWS - 1, BT_COLS - 1, BT_ROWS - 1)    // patička přes celou šířku
+
+if barstate.islast and btOn and not na(btTb)
+    color  hc   = color.new(cNeut, T_BT_HEAD)
+    string rrT  = fd(rr) + "R"
+    string exT  = btExit == "Do Asie (čas NY)" ? "výstup " + (btExH < 10 ? "0" : "") + str.tostring(btExH) + ":" + (btExM < 10 ? "0" : "") + str.tostring(btExM) + " NY" : btExit == "Konec session" ? "výstup konec session" : btExit == "Po N svíčkách" ? "výstup po " + str.tostring(btMaxBars) + " sv." : "bez časového výstupu (SL / 100R)"
+    string rngT = na(btT0) ? "—" : str.format_time(btT0, "dd.MM.yy", TZ) + "–" + str.format_time(btT1, "dd.MM.yy", TZ)
+    string hdr  = "Backtest · " + syminfo.ticker + " · " + rngT + " · " + str.tostring(btNSess) + " session (trend " + str.tostring(btNTrend) + " / range " + str.tostring(btNRange) + ", s obchody " + str.tostring(btNSessTr) + ")\n" + (slMode == "Fixní stop" ? "stop " + fd(stopPts) + " b." : "SL za wick/level") + " · TP " + rrT + " · " + exT + " · " + btMode + " · náklady " + fd(btCost) + " b. · SL i TP v 1 svíčce: " + btSameBar
+    btCell(btTb, 0, 0, hdr, hc, na, "Simulace nakreslených entry ve směru biasu (entry proti biasu se nepočítají; RETAP·DISP s entry na close svíčky retapu). Vyhodnocení od svíčky po vstupu, jen uzavřené svíčky, výstup přesně na SL / TP. Trend / range = počet ukončených RTH sessions podle typu dne (neúplná první RTH grafu se nepočítá).")
+    // názvy sloupců + vysvětlení v tooltipu
+    string tReach = "Kolik % obchodů dosáhlo MFE (max. pohyb ve prospěch) aspoň tolik R před SL / časovým výstupem."
+    string tEV    = "EV = průměrný výsledek v R po nákladech, kdyby byl cíl (TP) tolik R: dosažen → +X, SL → −1 (výstup přesně na SL, i při gapu), jinak R časového výstupu. Jen uzavřené obchody (N)."
+    array<string> hd = array.from("Typ", "N", "Win " + rrT + " %", "Σ R " + rrT, "PF", "≥5R %", "≥10R %", "≥20R %", "≥50R %", "≥100R %", "EV 2R", "EV 5R", "EV 10R", "EV 20R", "EV 50R", "EV 100R", "DD R", "Série")
+    array<string> ht = array.from("Typ entry z kandidáta s nejvyšší prioritou (RETAP > PROTI WICKU > RUN > DISP). Najeď na název řádku = kompletní statistika vč. všech cílů 1–100R.", "Počet uzavřených obchodů (pro ≥X R a EV; otevřené se nepočítají). Win % / Σ R / PF / DD / série počítají i otevřené obchody, jejichž fixní TP / SL je už rozhodnutý.", "Fixní TP " + rrT + ": TP / (TP + SL) v %. Zapíše se, jakmile se fixní TP / SL rozhodne (i když obchod běží dál k cílům 1–100R). Časové výstupy se nepočítají (jejich R je v Σ R).", "Součet R při fixním TP " + rrT + " po nákladech (vč. časových výstupů).", "Profit factor (fixní TP) = Σ kladných R / |Σ záporných R|. — = žádná ztráta.", tReach, tReach, tReach, tReach, tReach, tEV, tEV, tEV, tEV, tEV, tEV, "Max. drawdown kumulativní křivky R (fixní TP " + rrT + ") v pořadí, kdy se fixní TP / SL / časový výstup rozhodl.", "Nejdelší série ztrátových obchodů po sobě (R < 0, fixní TP, pořadí rozhodnutí).")
+    for c = 0 to BT_COLS - 1
+        btCell(btTb, c, 1, hd.get(c), hc, na, ht.get(c))
+    // typy entry (jen s daty)
+    array<string> kNm = array.from("RETAP·DISP", "RETAP·ZÓNA", "WICK·SWING", "WICK·ZÓNA", "DISP", "RUN")
+    array<string> kTp = array.from("Retap po displacementu (zdroj obsahuje DISP, i sloučený se zónou). V backtestu entry na close svíčky retapu – signál existuje až po close (E na grafu = level limitky; backtest ho nepoužívá, aby nevybíral jen filly s příznivým close). SL: fixní stop od close, za wick/level = SL z grafu.", "Retap zóny / auto levelu / single printu po RESPECT nebo RUN – entry na close; rejection podle volby Retap zóny → entry jen s rejection svíčkou.", "PROTI WICKU na hraně range – wick vybral swing high / low a svíčka uzavřela zpět.", "PROTI WICKU při respektu zóny / auto levelu / single printu.", "Entry na close displacement svíčky (close za swing high / low).", "Entry na close svíčky, která proběhla skrz zónu (jen při Entry na RUN skrz zónu).")
+    for k = 0 to BT_NK - 1
+        if btHas(k)
+            btRow(btTb, 2 + k, k, kNm.get(k), na, kTp.get(k))
+    btRow(btTb, 8, BT_TOT, "CELKEM", color.new(cNeut, T_BT_SEC), "Všechny obchody.")
+    btRow(btTb, 9, BT_LONG, "LONG", na, "Jen long obchody.")
+    btRow(btTb, 10, BT_SHORT, "SHORT", na, "Jen short obchody.")
+    string dTp = "Typ dne podle RTH (9:30–16:00 NY), určí se po jejím konci: trend, když |close − open| ≥ " + fd(btTrendThr) + " × (high − low), jinak range. Obchod patří k RTH session vstupu; výsledky z ještě neukončené session čekají (zapíší se v pořadí). Neúplná první RTH grafu (graf začíná uprostřed session) se neklasifikuje – její obchody jsou jen v ostatních řádcích."
+    btRow(btTb, 11, BT_TREND, "TREND dny (" + str.tostring(btNTrend) + ")", na, dTp)
+    btRow(btTb, 12, BT_RANGE, "RANGE dny (" + str.tostring(btNRange) + ")", na, dTp)
+    array<string> bNm = array.from("9:30–10:30", "10:30–12:00", "12:00–14:00", "14:00–16:00")
+    for b = 0 to 3
+        btRow(btTb, 13 + b, BT_B0 + b, bNm.get(b), na, "Čas vstupu = otevření svíčky entry (NY).")
+    if btHas(BT_BX)
+        btRow(btTb, 17, BT_BX, "jiný čas", na, "Vstup mimo 9:30–16:00 NY (vlastní session).")
+    if smtOn
+        string smtTp = "Stejný směr SMT na předchozích 1 až " + str.tostring(smtLook) + " svíčkách před entry; SMT na vstupní svíčce se nepočítá."
+        btRow(btTb, 18, BT_SMT, "s SMT", na, smtTp)
+        btRow(btTb, 19, BT_NOSMT, "bez SMT", na, smtTp)
+    // uzavřené obchody čekající na typ dne (záznamy jen s fixním TP se nepočítají)
+    int nPend = 0
+    for pr in btPend
+        if not pr.fixOnly
+            nPend += 1
+    string ft = "Otevřené obchody: " + str.tostring(btOpen.size()) + " · uzavřené čekají na typ dne: " + str.tostring(nPend) + " · Win % / Σ R / PF / DD / série = fixní TP " + rrT + " · ≥X R = MFE · EV = cíl X R · vše po nákladech\nNajeď myší na název řádku (kompletní statistika) nebo sloupce (vysvětlení)."
+    btCell(btTb, 0, BT_ROWS - 1, ft, color.new(cNeut, T_BT_FOOT), na, "")
