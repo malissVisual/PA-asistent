@@ -16,6 +16,8 @@ indicator("1m Price Action Asistent", shorttitle="PA Asist", overlay=true, max_l
 //  a sytější výplň. Jen kresba – do vyhodnocení zón, entry ani alertů nevstupují.
 //  TPO profily = histogramy posledních oken (+ tvořící se okno) vedle sebe vpravo od ceny nebo na svém místě:
 //  value area modře, okraje fialově, POC čára. Jen kresba.
+//  Clustery z footprintu (Premium) = ceny s výjimečně velkým objemem v 1m svíčce; zelené nákupy, červené prodeje,
+//  fialové vyrovnané; pruh vede doprava, dokud se k němu cena nevrátí. Jen kresba.
 //  Vzhled: tečky = rejection wicky, ↑↓ = displacement, ▲▼ = entry, × = FAIL,
 //  ◆ = respect zóny, ◇ = první dotek po RUN, ◈ = SMT divergence. Na grafu žádný text – detaily v tooltipu (najeď myší).
 //  Stav = tečka vpravo. Vše jen na UZAVŘENÉ svíčce → žádný repaint. "b." = body.
@@ -36,6 +38,9 @@ SP_BACK    = 4999    // single prints se kreslí od svého vzniku, nejdřív tol
 SP_MAXROWS = 2000    // max. řádků jednoho okna (větší rozsah = okno se přeskočí)
 TP_KEEP    = 20      // max. uložených hotových TPO profilů (kresba)
 TP_ROOM    = 495     // TPO profily vpravo: max. svíček za poslední svíčkou (TradingView kreslí max. 500 do budoucna)
+FC_DONE    = 40      // max. ukončených (zesvětlených) clusterů z footprintu v historii
+FC_NEUT    = 0.1     // cluster z footprintu: |delta| < tento podíl objemu = vyrovnaný (fialový)
+FC_MINBUF  = 5       // min. svíček v průměru objemu řádku, než se clustery začnou hledat
 // Backtest (skupiny statistik: 0–5 typy entry, pak souhrny)
 BT_NK      = 6       // typy entry: 0 RETAP·DISP, 1 RETAP·ZÓNA, 2 WICK·SWING, 3 WICK·ZÓNA, 4 DISP, 5 RUN
 BT_TOT     = 6       // CELKEM
@@ -73,6 +78,7 @@ GM = "SMT"
 GT = "Zóna s cenou uvnitř"
 GC = "Clustery (TPO)"
 GTP = "TPO profily"
+GF = "Clustery (footprint)"
 MAX_SMT = 60
 SMT_HISTORY = 3000
 
@@ -203,6 +209,7 @@ ST_ZONE     = line.style_solid     // okraj zóny
 ST_ZONE_RUN = line.style_dashed    // okraj zóny po run-through
 ST_SP       = line.style_solid     // single print (box / čára)
 ST_CL       = line.style_dotted    // okraj clusteru
+ST_FC       = line.style_solid     // cluster z footprintu
 ST_SMT      = line.style_dotted
 ST_OPEN     = line.style_dotted    // Open 9:30
 // ── Průhlednosti: značky
@@ -258,6 +265,11 @@ T_CL_BRD    = 50    // okraj clusteru
 T_CL_BG     = 88    // výplň clusteru z jednoho okna
 T_CL_STEP   = 6     // každé další sloučené okno = výplň o tolik sytější
 T_CL_BG_MIN = 70    // nejsytější výplň clusteru
+// (barvy clusterů z footprintu: zelená = Bull, červená = Bear, fialová = vstup cFcN na konci vstupů)
+T_FC_BRD    = 25    // okraj aktivního clusteru z footprintu
+T_FC_BG     = 65    // výplň aktivního clusteru
+T_FC_DONE   = 75    // cluster po návratu ceny (okraj)
+T_FC_DONE_BG = 90   // cluster po návratu ceny (výplň)
 // (barvy TPO profilů jsou vstupy na konci vstupů – skupina „TPO profily“)
 T_TPO_VA    = 35    // výplň value area
 T_TPO_OUT   = 45    // výplň mimo value area
@@ -337,6 +349,15 @@ tpLabels = input.bool(true, "Čas pod profilem (detail v tooltipu)", tooltip="Po
 
 // Single prints – barva podle směru (vstup na konci, aby se neposunulo uložené nastavení)
 spDirCol = input.bool(true, "Single prints: barva podle směru", tooltip="Zapnuto: single print, kterým cena proletěla nahoru (býčí svíčka), má barvu Bull / long, dolů barvu Bear / short. Vypnuto: všechny barvou Single prints.", group=GS, display=display.none)
+
+// GF – Clustery z footprintu (vstupy na konci, aby se neposunulo uložené nastavení)
+fcOn   = input.bool(true, "Clustery z footprintu (Premium)", tooltip="Vyžaduje TradingView Premium / Ultimate (footprint data). Cluster = cena (řádek footprintu, příp. víc sousedních), kde se v jedné 1m svíčce zobchodoval výjimečně velký objem. Zelená = převaha nákupů, červená = převaha prodejů, fialová = vyrovnané. Pruh vede od své svíčky doprava, dokud se k němu cena nevrátí – pak skončí na svíčce dotyku a zesvětlí se. Jen kresba – entry, alerty ani zóny nemění.", group=GF, display=display.none)
+fcTicks = input.int(4, "Výška řádku (ticky)", minval=1, maxval=100, tooltip="Výška jednoho řádku footprintu v ticích. NQ / MNQ: 4 ticky = 1 bod. ES / MES: 1–2 ticky.", group=GF, display=display.none)
+fcMult = input.float(4.0, "Cluster = objem řádku ≥ × průměr", minval=1.5, step=0.5, tooltip="Řádek je cluster, když má aspoň tolikrát větší objem než průměrný řádek posledních svíček (viz níže). Větší číslo = méně, ale silnějších clusterů.", group=GF, display=display.none)
+fcLen  = input.int(30, "Průměr objemu řádku (svíčky)", minval=5, maxval=500, tooltip="Z kolika posledních svíček se počítá průměrný objem jednoho řádku.", group=GF, display=display.none)
+fcSess = input.bool(true, "Jen v session", tooltip="Zapnuto: clustery se hledají jen ve svíčkách session (overnight má malý objem). Vypnuto: celý den.", group=GF, display=display.none)
+fcMax  = input.int(40, "Max. aktivních clusterů", minval=5, maxval=100, tooltip="Kolik clusterů, ke kterým se cena ještě nevrátila, držet; při překročení se zahodí nejvzdálenější od ceny. Kreslí se podle volby Zóny → Kreslit zóny do vzdálenosti.", group=GF, display=display.none)
+cFcN   = input.color(#8E6BBF, "Barva vyrovnaného clusteru", tooltip="Cluster s vyrovnanými nákupy a prodeji. Nákupy = barva Bull / long, prodeje = Bear / short.", group=GF, display=display.none)
 
 // ───────── Odvozená nastavení ─────────
 tsz          = txtSize == "Drobný" ? SZ_PANEL_S : txtSize == "Normální" ? SZ_PANEL_L : SZ_PANEL_M
@@ -1863,6 +1884,91 @@ if conf and spz.size() > spMax
         spRemove(zr, false)
         cg2 += 1
 
+// ═════ CLUSTERY Z FOOTPRINTU (TradingView Premium) – jen kresba ═════
+// Footprint každé uzavřené svíčky (řádky po fcTicks ticích). Cluster = souvislé řádky, z nichž každý má objem
+// ≥ fcMult × průměrný objem řádku za posledních fcLen svíček (výjimečně velký objem na jedné ceně). Barva podle
+// delty bloku: nákupy převažují → Bull, prodeje → Bear, |delta| < FC_NEUT × objem → cFcN (fialová).
+// Cluster vede od své svíčky doprava, dokud do něj nezasáhne pozdější svíčka; na ní skončí a zesvětlí se.
+// Ve skriptu smí být jen JEDNO volání request.footprint. Historie footprintu nemusí být u všech svíček (na → přeskočit).
+fpId = request.footprint(fcTicks, 70, 300)
+var array<Zone>  fcz    = array.new<Zone>()     // aktivní clustery (cena se k nim ještě nevrátila)
+var array<box>   fcDone = array.new<box>()      // ukončené (zesvětlené) clustery
+var array<float> fcBuf  = array.new<float>()    // průměrný objem řádku posledních svíček
+
+fcColor(int d) => d == 1 ? cBull : d == -1 ? cBear : cFcN
+
+// Aktivní cluster x1..x2 (box; 1 řádek = tenký pruh)
+fcDraw(Zone z, int x1, int x2) =>
+    color c = fcColor(z.dir)
+    if na(z.bx)
+        z.bx := box.new(x1, z.top, x2, z.bot, border_color=color.new(c, T_FC_BRD), border_width=W_LINE, border_style=ST_FC, bgcolor=color.new(c, T_FC_BG))
+    else
+        z.bx.set_lefttop(x1, z.top)
+        z.bx.set_rightbottom(x2, z.bot)
+    z.dir
+
+// Návrat ceny: zesvětlená kresba od vzniku do této svíčky (max. FC_DONE; začátek max. SP_BACK svíček zpět)
+fcFinish(Zone z) =>
+    zErase(z)
+    color c = fcColor(z.dir)
+    box   b = box.new(math.max(nz(z.x0, bar_index), bar_index - SP_BACK, 0), z.top, bar_index, z.bot, border_color=color.new(c, T_FC_DONE), border_width=W_LINE, border_style=ST_FC, bgcolor=color.new(c, T_FC_DONE_BG))
+    fcDone.push(b)
+    if fcDone.size() > FC_DONE
+        box.delete(fcDone.shift())
+    fcDone.size()
+
+if conf and fcOn
+    // 1) dotek: pozdější svíčka zasáhne do clusteru → konec
+    if fcz.size() > 0
+        for i = fcz.size() - 1 to 0
+            Zone z = fcz.get(i)
+            if bar_index > z.born and high >= z.bot and low <= z.top
+                fcFinish(z)
+                fcz.remove(i)
+    // 2) nové clustery z footprintu této svíčky
+    if not na(fpId) and (not fcSess or inSess)
+        array<volume_row> fRows = footprint.rows(fpId)
+        int nF = fRows.size()
+        if nF > 0
+            float tv = 0.0
+            for r in fRows
+                tv += volume_row.total_volume(r)
+            float ref = fcBuf.size() >= math.min(fcLen, FC_MINBUF) ? fcBuf.avg() : na
+            if not na(ref) and ref > 0
+                float lim = fcMult * ref
+                int   rsI = -1
+                for i = 0 to nF
+                    bool big = i < nF and volume_row.total_volume(fRows.get(i)) >= lim
+                    if big and rsI < 0
+                        rsI := i
+                    else if not big and rsI >= 0
+                        // řádky jsou od nejnižší ceny → blok rsI..i-1
+                        float v = 0.0
+                        float d = 0.0
+                        for j = rsI to i - 1
+                            v += volume_row.total_volume(fRows.get(j))
+                            d += volume_row.delta(fRows.get(j))
+                        Zone zf = Zone.new(volume_row.up_price(fRows.get(i - 1)), volume_row.down_price(fRows.get(rsI)), "FP", false, na, 0, 0, -1000, 0)
+                        zf.x0   := bar_index
+                        zf.born := bar_index
+                        zf.dir  := math.abs(d) < FC_NEUT * v ? 0 : d > 0 ? 1 : -1
+                        fcz.push(zf)
+                        rsI := -1
+            fcBuf.push(tv / nF)
+            if fcBuf.size() > fcLen
+                fcBuf.shift()
+    // max. fcMax aktivních – zahodit nejvzdálenější od ceny (bez historie)
+    while fcz.size() > fcMax
+        int   iF = 0
+        float dF = -1.0
+        for i = 0 to fcz.size() - 1
+            Zone  zq = fcz.get(i)
+            float dd = close > zq.top ? close - zq.top : close < zq.bot ? zq.bot - close : 0.0
+            if dd > dF
+                dF := dd
+                iF := i
+        zErase(fcz.remove(iF))
+
 // FAIL texty podle strany: selhaný long = pohyb dolů → připojí se ke značce ↓ (a naopak)
 string failTxtUp = ""
 string failTxtDn = ""
@@ -2426,6 +2532,13 @@ if barstate.islast
             clDraw(zc, math.min(math.max(nz(zc.x0, xL), xL), bar_index), xR)
         else
             zErase(zc)
+    // clustery z footprintu: od své svíčky (max. SP_BACK zpět) kousek za poslední svíčku, jen blízko ceny
+    for zf in fcz
+        float df = close > zf.top ? close - zf.top : close < zf.bot ? zf.bot - close : 0.0
+        if fcOn and (zoneShowPts <= 0 or df <= zoneShowPts)
+            fcDraw(zf, math.min(math.max(nz(zf.x0, xL), bar_index - SP_BACK, 0), bar_index), bar_index + 3)
+        else
+            zErase(zf)
     // TPO profily: smazat a nakreslit znovu (posledních tpN hotových + tvořící se okno)
     for pl in tpPolys
         pl.delete()
